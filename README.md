@@ -180,20 +180,3 @@ gcloud pubsub subscriptions pull accent-field-inspectors --auto-ack --limit 5
 ```
 
 ---
-
-## Benchmark Cases Included
-
-1. **Industrial Effluent Confounding (Kanpur, India)**:
-   Hexavalent Chromium sampled on a 98.2nd-percentile monsoon deluge day. River flow diluted the sample by 8×. When normalized against dry-weather baseline flow, effluent concentrations exceed statutory discharge limits by 320%.
-2. **Statutory Compliance Clearance (Himachal Pradesh, India)**:
-   Surface water monitoring at Nalagarh industrial estate conducted under normal dry-weather conditions (0.0 mm rain verified via CHIRPS). Effluent pH complies with State Pollution Control Board standards, triggering automated clearance.
-3. **Reference Plot Elevation Manipulation (East Kalimantan, Indonesia)**:
-   A claimed +22.7% canopy gain drops to +2.5% once season-matched. SRTM elevation data reveals the reference control plot was sited on a 34° ridge beside an active haul road, artificially exaggerating baseline deforestation risk.
-4. **Out-of-Scope Grid Renewable Project (Shandong, China)**:
-   A grid-connected coastal wind farm filing. The system recognizes that displacement claims require electrical SCADA telemetry and metering logs rather than optical satellite indices, and issues an advisory guidance note.
-
----
-
-## License
-
-This project is licensed under the Apache 2.0 License.
