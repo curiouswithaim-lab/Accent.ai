@@ -54,7 +54,7 @@ flowchart LR
 
 ## Specialized Forensic Capabilities
 
-- **Dynamic Forestry Metrics (REDD+ vs. ARR)**: Distinguishes avoided deforestation rates (e.g. Kariba, Rimba Raya) from afforestation canopy gain. Never compares an avoided deforestation baseline to net vegetative growth.
+- **Dynamic Forestry Metrics (REDD+ vs. ARR)**: Distinguishes avoided deforestation rates from afforestation canopy gain. Never compares an avoided deforestation baseline to net vegetative growth.
 - **Satellite Sensor Anachronism Protection**: Automatically selects the historically accurate satellite sensor. For filings with baseline dates prior to June 2015 (before Sentinel-2 was launched), the system dynamically uses **Landsat 5/7** and **MODIS Surface Reflectance**, preventing sensor anachronisms.
 - **Topography & Elevation Auditing**: If an applicant omits baseline elevation, the system bypasses misleading zero-elevation mathematical variances and instead benchmarks the location using independent SRTM elevation and slope telemetry.
 - **Out-of-Scope Methodology Detection**: For non-land-use filings (such as grid-connected wind, solar, or cookstoves that depend on electrical SCADA data rather than surface reflectance), the system provides clear advisory notices rather than forcing optical satellite checks.
@@ -67,8 +67,6 @@ flowchart LR
 ```text
 ├── app.py                      # Main Streamlit audit workspace and interactive dashboard
 ├── schemas.py                  # Pydantic data models for extraction and satellite evidence
-├── demo_data/
-│   └── golden_cases.py         # Benchmark cases for demonstration and testing
 ├── services/
 │   ├── __init__.py             # Google Cloud project and authentication setup
 │   ├── gemini_extractor.py     # Vertex AI Gemini extraction and audit review logic
@@ -108,7 +106,7 @@ streamlit run app.py
 
 The app will be available at [http://localhost:8501](http://localhost:8501).
 
-> **Graceful Fallbacks**: You do not need live cloud credentials to explore. Accent.AI includes built-in offline benchmark cases (Kanpur Tannery EIA, Himachal Pradesh Industrial Clearance, Kalimantan REDD+, and Shandong Wind Farm). If Google Cloud services are not configured, the app falls back to realistic deterministic telemetry without crashing.
+> **Graceful Fallbacks**: Accent.AI includes deterministic fallbacks. If Google Cloud services are temporarily offline or unauthenticated, the app operates cleanly without crashing.
 
 ---
 
@@ -121,24 +119,24 @@ To enable live Google Earth Engine, Vertex AI, and Cloud Pub/Sub integrations:
 gcloud auth application-default login
 
 # Set your project configuration
-export GOOGLE_CLOUD_PROJECT=accent-511817
+export GOOGLE_CLOUD_PROJECT=your-gcp-project-id
 export GOOGLE_CLOUD_LOCATION=us-central1
 
 # Optional overrides
 export GEMINI_API_KEY=your_gemini_api_key       # Fallback if Vertex AI quota is constrained
 export ACCENT_PUBSUB_TOPIC=accent-ground-dispatch
-export ACCENT_BUCKET=accent-511817-accent-filings
+export ACCENT_BUCKET=your-gcp-project-id-accent-filings
 ```
 
 ### Environment Variables
 
 | Variable | Description | Default |
 |---|---|---|
-| `GOOGLE_CLOUD_PROJECT` | Google Cloud Project ID for Vertex AI, BigQuery, and Pub/Sub | `accent-511817` |
+| `GOOGLE_CLOUD_PROJECT` | Google Cloud Project ID for Vertex AI, BigQuery, and Pub/Sub | `your-gcp-project-id` |
 | `GOOGLE_CLOUD_LOCATION` | Region for Vertex AI API calls | `us-central1` |
 | `GEMINI_API_KEY` | Optional developer API key fallback | — |
 | `ACCENT_PUBSUB_TOPIC` | Pub/Sub topic for regulatory dispatch events | `accent-ground-dispatch` |
-| `ACCENT_BUCKET` | Google Cloud Storage bucket for PDF document staging | `accent-511817-accent-filings` |
+| `ACCENT_BUCKET` | Google Cloud Storage bucket for PDF document staging | `your-gcp-project-id-accent-filings` |
 | `ACCENT_FORCE_OFFLINE` | Set to `1` to run strictly in offline simulation mode | `0` |
 
 ---
@@ -179,4 +177,8 @@ You can pull dispatched inspection alerts in real time:
 gcloud pubsub subscriptions pull accent-field-inspectors --auto-ack --limit 5
 ```
 
----
+
+## License
+
+This project is licensed under the Apache 2.0 License.
+

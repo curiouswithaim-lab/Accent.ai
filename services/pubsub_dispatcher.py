@@ -15,7 +15,7 @@ from services import PUBSUB_TOPIC_ID, force_offline, gcp_project, has_gcp_creden
 
 
 def topic_path(project_id: Optional[str] = None) -> str:
-    return f"projects/{project_id or gcp_project() or 'accent-511817'}/topics/{PUBSUB_TOPIC_ID}"
+    return f"projects/{project_id or gcp_project() or 'your-gcp-project-id'}/topics/{PUBSUB_TOPIC_ID}"
 
 
 def build_payload(action: GroundDispatchAction, report: Optional[FullAuditReport] = None,

@@ -14,7 +14,7 @@ logger = logging.getLogger("accent_ai")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-DEFAULT_PROJECT_ID = "accent-511817"
+DEFAULT_PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", "your-gcp-project-id")
 PUBSUB_TOPIC_ID = os.getenv("ACCENT_PUBSUB_TOPIC", os.getenv("TERRATRIAL_PUBSUB_TOPIC", "accent-ground-dispatch"))
 
 

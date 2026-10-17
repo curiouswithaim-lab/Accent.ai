@@ -16,7 +16,7 @@ LOCAL_DIR = Path(os.getenv("ACCENT_LOCAL_ARTIFACTS", os.getenv("TERRATRIAL_LOCAL
 
 
 def bucket_name() -> str:
-    return os.getenv("ACCENT_BUCKET") or os.getenv("TERRATRIAL_BUCKET") or f"{gcp_project() or 'accent-511817'}-accent-filings"
+    return os.getenv("ACCENT_BUCKET") or os.getenv("TERRATRIAL_BUCKET") or f"{gcp_project() or 'your-gcp-project-id'}-accent-filings"
 
 
 def _safe(name: str) -> str:

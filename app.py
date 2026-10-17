@@ -27,7 +27,14 @@ st.set_page_config(
     menu_items={"About": "Accent.AI (Audit of Carbon Credits and ENvironmental impacT on land using AI) · AI Builder Cup 2026 · Google Cloud JAPAC Hackathon (Theme 6)"},
 )
 
-from demo_data.golden_cases import GOLDEN_CASES, build_sample_pdf  # noqa: E402
+try:
+    from demo_data.golden_cases import GOLDEN_CASES, build_sample_pdf  # noqa: E402
+    HAS_GOLDEN = True
+except ImportError:
+    GOLDEN_CASES = {}
+    build_sample_pdf = lambda k: b""
+    HAS_GOLDEN = False
+
 from schemas import ExtractedFilingData, FullAuditReport, SatelliteEvidence  # noqa: E402
 from services import adc_status  # noqa: E402
 from services.earth_engine_verifier import circle_polygon, init_earth_engine, verify_filing, wedge_polygon  # noqa: E402
@@ -385,19 +392,20 @@ def platform_status() -> Dict[str, Any]:
     return dict(adc=has, project=project, adc_detail=detail, gemini=gemini_status(), gemini_ok=gemini_available(),
                 ee=ee_ok, ee_detail=ee_detail, cloud_run=bool(os.getenv("K_SERVICE")))
 
-
 @st.cache_data(show_spinner=False)
 def sample_pdfs() -> Dict[str, bytes]:
-    return {k: build_sample_pdf(k) for k in GOLDEN_CASES}
+    return {k: build_sample_pdf(k) for k in GOLDEN_CASES} if HAS_GOLDEN else {}
 
 
 @st.cache_data(show_spinner=False)
 def sample_fingerprints() -> Dict[str, str]:
-    return {hashlib.sha256(b).hexdigest(): k for k, b in sample_pdfs().items()}
+    return {hashlib.sha256(b).hexdigest(): k for k, b in sample_pdfs().items()} if HAS_GOLDEN else {}
 
 
 @st.cache_data(show_spinner=False)
 def get_precomputed_golden_audit(key: str) -> Dict[str, Any]:
+    if not HAS_GOLDEN or key not in GOLDEN_CASES:
+        return {}
     case = GOLDEN_CASES[key]
     extracted, profile = case["extracted"], case["profile"]
     ev = verify_filing(extracted, profile, prefer_live=False)
@@ -412,9 +420,9 @@ def get_precomputed_golden_audit(key: str) -> Dict[str, Any]:
     )
 
 
-# Pre-warm benchmark audits into cache for instant opening
-for _k in GOLDEN_CASES:
-    get_precomputed_golden_audit(_k)
+if HAS_GOLDEN:
+    for _k in GOLDEN_CASES:
+        get_precomputed_golden_audit(_k)
 
 
 PS = platform_status()
@@ -444,18 +452,19 @@ def render_hero() -> None:
 # ---------------------------------------------------------------------------
 def render_sidebar() -> Dict[str, bool]:
     with st.sidebar:
-        H('<div class="tt-side-h">Benchmark Filings</div>'
-          '<div class="tt-side-s">Simulation run for benchmarking and demo.</div>')
-        active_key = ss.audit.get("sha") if (ss.audit and ss.audit.get("source") == "golden") else None
+        if HAS_GOLDEN and GOLDEN_CASES:
+            H('<div class="tt-side-h">Benchmark Filings</div>'
+              '<div class="tt-side-s">Simulation run for benchmarking and demo.</div>')
+            active_key = ss.audit.get("sha") if (ss.audit and ss.audit.get("source") == "golden") else None
 
-        for key, case in GOLDEN_CASES.items():
-            is_active = (active_key == key)
-            label = f"● {case['title']}  [ACTIVE]" if is_active else case['title']
-            if st.button(label, key=f"side_{key}", width="stretch",
-                         type="primary" if is_active else "secondary", help=case["tagline"]):
-                ss.audit = get_precomputed_golden_audit(key)
-                ss.pending = None
-                st.rerun()
+            for key, case in GOLDEN_CASES.items():
+                is_active = (active_key == key)
+                label = f"● {case['title']}  [ACTIVE]" if is_active else case['title']
+                if st.button(label, key=f"side_{key}", width="stretch",
+                             type="primary" if is_active else "secondary", help=case["tagline"]):
+                    ss.audit = get_precomputed_golden_audit(key)
+                    ss.pending = None
+                    st.rerun()
 
         # If user has audited live documents, show quick switcher
         if ss.live_audits:
@@ -492,12 +501,13 @@ def render_sidebar() -> Dict[str, bool]:
             }
             st.rerun()
 
-        with st.expander("Need sample test PDFs?"):
-            st.caption("Download sample filings to test live uploads:")
-            for key, case in GOLDEN_CASES.items():
-                slot_tag = "EIA" if case["extracted"].filing_mode == "EIA_CLEARANCE" else "Carbon"
-                st.download_button(f"Download [{slot_tag}] {case['title']}", data=sample_pdfs()[key], file_name=case["filename"],
-                                   mime="application/pdf", key=f"dl_{key}", width="stretch")
+        if HAS_GOLDEN and GOLDEN_CASES:
+            with st.expander("Need sample test PDFs?"):
+                st.caption("Download sample filings to test live uploads:")
+                for key, case in GOLDEN_CASES.items():
+                    slot_tag = "EIA" if case["extracted"].filing_mode == "EIA_CLEARANCE" else "Carbon"
+                    st.download_button(f"Download [{slot_tag}] {case['title']}", data=sample_pdfs()[key], file_name=case["filename"],
+                                       mime="application/pdf", key=f"dl_{key}", width="stretch")
 
         st.divider()
         H('<div class="tt-side-h">Audit Configuration</div>')
@@ -544,17 +554,17 @@ def process_pending(opts: Dict[str, bool]) -> None:
     ss.pending = None
     if not job:
         return
-    if job["kind"] == "golden" and not opts.get("live_golden", False):
+    if job["kind"] == "golden" and HAS_GOLDEN and not opts.get("live_golden", False):
         ss.audit = get_precomputed_golden_audit(job["key"])
         return
 
     def _run_single(job_item: dict, step_prefix: str = "") -> dict:
         t0 = time.time()
-        if job_item["kind"] == "golden":
+        if job_item["kind"] == "golden" and HAS_GOLDEN and job_item.get("key") in GOLDEN_CASES:
             case = GOLDEN_CASES[job_item["key"]]
             extracted, profile, warnings, staging = case["extracted"], case["profile"], [], None
             extraction_engine = "Benchmark case · Pre-verified document extraction"
-            prefer_live, filename = opts["live_golden"], case["filename"]
+            prefer_live, filename = opts.get("live_golden", False), case["filename"]
             st.write(f"{step_prefix}① Loaded benchmark filing **{case['title']}**")
         else:
             pdf, filename = job_item["bytes"], job_item["name"]
@@ -566,9 +576,9 @@ def process_pending(opts: Dict[str, bool]) -> None:
             extracted, extraction_engine, warnings = extract_filing(pdf, filename, mode_hint=mode_hint)
             detected_mode_str = "Environmental Clearance (EIA)" if extracted.filing_mode == "EIA_CLEARANCE" else "Carbon Offset (PDD)"
             st.write(f"{step_prefix}&nbsp;&nbsp;↳ **Document Type:** {detected_mode_str}")
-            match = sample_fingerprints().get(sha)
-            profile = GOLDEN_CASES[match]["profile"] if match else None
-            prefer_live = opts["live_golden"] if match else True
+            match = sample_fingerprints().get(sha) if HAS_GOLDEN else None
+            profile = GOLDEN_CASES[match]["profile"] if (match and HAS_GOLDEN) else None
+            prefer_live = opts.get("live_golden", True) if match else True
             if match:
                 warnings.append(f"Fingerprint matches benchmark sample '{GOLDEN_CASES[match]['title']}' — precomputed "
                                 "observations used where live Earth Engine layers are offline.")
@@ -1718,28 +1728,58 @@ def _report_json(a: Dict[str, Any]) -> str:
 # Landing
 # ---------------------------------------------------------------------------
 def render_landing() -> None:
-    H("""<div style="text-align:center;margin:18px 0 18px"><div style="font-family:'Space Grotesk';font-size:1.55rem;font-weight:600;color:#f1f5f9">
-    Independent Satellite Verification for Environmental Filings &amp; Carbon Baselines. <span style="color:#5eead4">Evidence Backed by Earth Observation.</span></div>
-    <div style="color:#94a3b8;font-size:.92rem;margin-top:6px">Simulation run for benchmarking and demo. Select a filing below or upload via the sidebar.</div></div>""")
-    cols = st.columns(2, gap="large")
-    bullets = {
-        "eia": ["Effluent sampled during a 98th-percentile flood (8× river dilution)",
-                "Ambient air monitoring station placed 2.1 km upwind of the smokestack",
-                "Riparian wetland corridor declared as 'degraded barren scrubland'"],
-        "carbon": ["Canopy growth measured right after monsoon rains against a dry-season baseline",
-                   "Control plot placed on a steep 34° slope next to an active logging road",
-                   "+42% spike in forest clearing within 2 km outside the project boundary"],
-    }
-    for col, (key, case) in zip(cols, GOLDEN_CASES.items()):
-        with col:
-            x = case["extracted"]
-            items = "".join(f"<li>{E(b)}</li>" for b in bullets[key])
-            H(f"""<div class="tt-case {key}"><div class="em">{case['emoji']}</div><h3>{E(case['title'])}</h3>
-            <p>{E(x.project_title)} · {E(x.region_name)}</p><ul>{items}</ul></div>""")
-            if st.button(f"Open benchmark audit  →", key=f"land_{key}", type="primary", width="stretch"):
-                ss.audit = get_precomputed_golden_audit(key)
-                ss.pending = None
+    if HAS_GOLDEN and GOLDEN_CASES:
+        H("""<div style="text-align:center;margin:18px 0 18px"><div style="font-family:'Space Grotesk';font-size:1.55rem;font-weight:600;color:#f1f5f9">
+        Independent Satellite Verification for Environmental Filings &amp; Carbon Baselines. <span style="color:#5eead4">Evidence Backed by Earth Observation.</span></div>
+        <div style="color:#94a3b8;font-size:.92rem;margin-top:6px">Simulation run for benchmarking and demo. Select a filing below or upload via the sidebar.</div></div>""")
+        cols = st.columns(2, gap="large")
+        bullets = {
+            "eia": ["Effluent sampled during a 98th-percentile flood (8× river dilution)",
+                    "Ambient air monitoring station placed 2.1 km upwind of the smokestack",
+                    "Riparian wetland corridor declared as 'degraded barren scrubland'"],
+            "carbon": ["Canopy growth measured right after monsoon rains against a dry-season baseline",
+                       "Control plot placed on a steep 34° slope next to an active logging road",
+                       "+42% spike in forest clearing within 2 km outside the project boundary"],
+        }
+        for col, (key, case) in zip(cols, GOLDEN_CASES.items()):
+            with col:
+                x = case["extracted"]
+                items = "".join(f"<li>{E(b)}</li>" for b in bullets.get(key, []))
+                H(f"""<div class="tt-case {key}"><div class="em">{case['emoji']}</div><h3>{E(case['title'])}</h3>
+                <p>{E(x.project_title)} · {E(x.region_name)}</p><ul>{items}</ul></div>""")
+                if st.button(f"Open benchmark audit  →", key=f"land_{key}", type="primary", width="stretch"):
+                    ss.audit = get_precomputed_golden_audit(key)
+                    ss.pending = None
+                    st.rerun()
+    else:
+        H("""<div style="text-align:center;margin:20px 0 28px">
+        <div style="font-family:'Space Grotesk';font-size:1.65rem;font-weight:600;color:#f1f5f9">
+        Independent Satellite Verification for Environmental Filings &amp; Carbon Baselines. <span style="color:#5eead4">Evidence Backed by Earth Observation.</span></div>
+        <div style="color:#94a3b8;font-size:1rem;margin-top:8px">Upload an Environmental Impact Assessment (EIA) or Carbon Credit Project Design Document (PDD) to begin independent satellite verification.</div>
+        </div>""")
+
+        _, mid, _ = st.columns([1, 6, 1])
+        with mid:
+            H("""<div style="background:#0d1424;border:1px solid rgba(45,212,191,0.25);border-radius:14px;padding:26px 30px;box-shadow:0 12px 30px -8px rgba(0,0,0,0.45);margin-bottom:12px">
+            <div style="font-family:'Space Grotesk';font-size:1.2rem;font-weight:600;color:#f8fafc;margin-bottom:6px">📁 Upload Filing Dossier (PDF)</div>
+            <div style="color:#94a3b8;font-size:.92rem;line-height:1.5;margin-bottom:16px">Gemini classifies the document type (EIA vs Carbon PDD), extracts declared sampling claims and coordinates, and audits them against independent satellite records (CHIRPS, ERA5, SRTM DEM, Sentinel-2 / Landsat 5/7, Hansen GFC, and NOAA GSOD).</div>
+            </div>""")
+            landing_pdf = st.file_uploader(
+                "Upload Filing Dossier (PDF)",
+                type=["pdf"],
+                key="landing_single_pdf",
+                label_visibility="collapsed",
+            )
+            if st.button("Run Independent Satellite Audit  →", key="run_landing_upload", type="primary", width="stretch", disabled=landing_pdf is None):
+                ss.pending = {
+                    "kind": "upload",
+                    "bytes": landing_pdf.getvalue(),
+                    "name": landing_pdf.name,
+                    "mode_hint": None,
+                }
                 st.rerun()
+
+    st.write("")
     st.write("")
     p = st.columns(3, gap="medium")
     pillars = [
@@ -1776,7 +1816,7 @@ def main() -> None:
     <span><b>{'EIA Clearance' if x.filing_mode == 'EIA_CLEARANCE' else 'Carbon Offset PDD'}</b></span><span class="sep"></span>
     <span>Audit Engine: <b>{E(a['audit_engine'])}</b></span><span class="sep"></span>
     <span>Audit Speed: <b>{a['elapsed']:.2f}s</b></span><span class="sep"></span>
-    <span>Source: <b>{'Benchmark Sample' if a['source'] == 'golden' else 'Live Upload'}</b></span></div>""")
+    <span>Source: <b>{'Benchmark Sample' if a.get('source') == 'golden' else 'Live Upload'}</b></span></div>""")
 
     # 2. Document Filing on Top in single line like header
     render_document_header(a)
