@@ -1,0 +1,64 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache & build
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Testing & Type Checking
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local & OS Files
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE configurations
+.idea/
+.vscode/
+
+# Secrets, Credentials, and Environment Files (NEVER COMMIT)
+.env
+.env.*
+*.env
+service-account*.json
+*credentials*.json
+*credential*.json
+*key*.json
+*.key
+*.pem
+*.json.key
+
+# Runtime Output & Caches
+.accent_artifacts/
+.terratrial_artifacts/
+*.log

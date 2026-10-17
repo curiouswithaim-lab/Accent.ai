@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.terratrial_artifacts/
+.git/
+.gitignore
+.DS_Store
+*.md
+!README.md
+gemini-code-*.md
+*.json.key
+service-account*.json
