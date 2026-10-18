@@ -18,11 +18,14 @@ import hashlib
 import json
 import math
 import os
+import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from schemas import (
+    BaselineSampling,
     BufferEvidence,
     BufferRing,
     ExtractedFilingData,
@@ -31,6 +34,7 @@ from schemas import (
     NdviEvidence,
     RainfallEvidence,
     SatelliteEvidence,
+    SiteLossSample,
     TerrainPoint,
     WindEvidence,
 )
@@ -41,6 +45,7 @@ EE_SCOPES = [
     "https://www.googleapis.com/auth/cloud-platform",
 ]
 HANSEN_ASSETS = [
+    "UMD/hansen/global_forest_change_2025_v1_13",
     "UMD/hansen/global_forest_change_2024_v1_12",
     "UMD/hansen/global_forest_change_2023_v1_11",
 ]
@@ -148,13 +153,43 @@ def _context(extracted: ExtractedFilingData, profile: Dict[str, Any]) -> Dict[st
     baseline_date = _parse_date(ndvi_prof.get("baseline_date", ""), default_baseline)
     is_carbon = extracted.filing_mode == "CARBON_OFFSET"
     radius = float(profile.get("buffer", {}).get("project_radius_km", 4.0 if is_carbon else 1.5))
+    is_redd = is_carbon and (extracted.subsector == "FORESTRY_REDD"
+                             or extracted.forestry_metric_type == "AVOIDED_DEFORESTATION_RATE")
+    redd_claim = redd_baseline_claim(claims)
 
     return dict(
         mode=extracted.filing_mode, is_carbon=is_carbon, project=project, control=control,
         air_sensor=air_sensor, water_sensor=water_sensor, points=pts,
         rain_date=rain_date, air_date=air_date, meas_date=meas_date, baseline_date=baseline_date,
-        radius_km=radius, veg_claim=veg_claim,
+        radius_km=radius, veg_claim=veg_claim, is_redd=is_redd,
+        project_sites=[p for p in pts if p.role == "PROJECT_SITE"][:MAX_SAMPLE_SITES] or [project],
+        control_sites=[p for p in pts if p.role == "CONTROL_SITE"][:3],
+        ref_period=_reference_period(redd_claim, rain_date),
     )
+
+
+_REDD_KW = ("deforestation", "loss rate", "counterfactual", "baseline")
+MAX_SAMPLE_SITES = 8
+SITE_RADIUS_KM = 10.0
+HANSEN_FIRST_YEAR, HANSEN_LAST_YEAR = 2001, 2024
+
+
+def redd_baseline_claim(claims: List[Any]) -> Optional[Any]:
+    """The filed baseline deforestation rate: a %/yr claim matching the REDD keywords, else any matching claim."""
+    matches = [c for c in claims if _match(c.parameter, _REDD_KW)]
+    return next((c for c in matches if "%" in (c.unit or "")), matches[0] if matches else None)
+
+
+def _reference_period(claim: Optional[Any], anchor: dt.date, last_year: int = HANSEN_LAST_YEAR) -> Tuple[int, int]:
+    """Years the filed baseline rate was measured over; defaults to the 3 years ending at the filing date."""
+    years = [int(y) for y in re.findall(r"(?:19|20)\d{2}", (claim.reference_period or "") if claim else "")]
+    if years:
+        a0, a1 = min(years), min(max(years), last_year)
+    else:
+        a1 = min(anchor.year, last_year)
+        a0 = a1 - 2
+    a1 = max(a1, HANSEN_FIRST_YEAR)
+    return min(max(a0, HANSEN_FIRST_YEAR), a1), a1
 
 
 def _seed(*parts: Any) -> int:
@@ -235,13 +270,19 @@ def _live_rainfall(ctx: Dict[str, Any]) -> RainfallEvidence:
     pt = ee.Geometry.Point([site.longitude, site.latitude])
     chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").select("precipitation")
     start, end = d - dt.timedelta(days=240), d + dt.timedelta(days=121)
-    rows = chirps.filterDate(start.isoformat(), end.isoformat()).getRegion(pt, 5566).getInfo()
+    clim_start, clim_end = dt.date(2009, 1, 1), dt.date(2025, 1, 1)
+    # One point time-series pull covering both the sampling window and the climatology; percentiles are
+    # computed locally (a server-side map over ~5,800 daily images regularly exceeded the EE deadline).
+    rows = chirps.filterDate(min(start, clim_start).isoformat(), max(end, clim_end).isoformat()) \
+        .getRegion(pt, 5566).getInfo()
     header = rows[0]
     it, ip = header.index("time"), header.index("precipitation")
-    series = sorted(
+    full = sorted(
         (dt.datetime.utcfromtimestamp(r[it] / 1000).date(), float(r[ip] or 0.0)) for r in rows[1:]
     )
-    if not series:
+    series = [s for s in full if start <= s[0] < end]
+    clim = np.array([s[1] for s in full if clim_start <= s[0] < clim_end])
+    if not series or clim.size == 0:
         raise RuntimeError("CHIRPS returned no rows")
     dates = [s[0].isoformat() for s in series]
     mm = [round(s[1], 2) for s in series]
@@ -249,21 +290,13 @@ def _live_rainfall(ctx: Dict[str, Any]) -> RainfallEvidence:
     v = by_date.get(d, max(by_date.items(), key=lambda kv: -abs((kv[0] - d).days))[1])
     antecedent = sum(by_date.get(d - dt.timedelta(days=k), 0.0) for k in range(0, 7))
 
-    clim = chirps.filterDate("2009-01-01", "2025-01-01")
-    stats = ee.Dictionary({
-        "rank": clim.map(lambda i: i.lt(v).add(i.lte(v)).divide(2)).mean()
-                    .reduceRegion(ee.Reducer.first(), pt, 5566).get("precipitation"),
-        "p95": clim.reduce(ee.Reducer.percentile([95]))
-                   .reduceRegion(ee.Reducer.first(), pt, 5566).get("precipitation_p95"),
-        "p50wet": clim.map(lambda i: i.updateMask(i.gt(1))).reduce(ee.Reducer.median())
-                      .reduceRegion(ee.Reducer.first(), pt, 5566).get("precipitation_median"),
-    }).getInfo()
-    pct = float(stats.get("rank") or 0.0) * 100
+    pct = float((np.mean(clim < v) + np.mean(clim <= v)) / 2 * 100)
+    wet = clim[clim > 1]
     dilution = float(np.clip(1.0 + antecedent / 18.0, 1.0, 15.0))
     return RainfallEvidence(
         dates=dates, precip_mm=mm, sampling_date=d.isoformat(), sampling_day_mm=round(v, 2),
-        sampling_percentile=round(pct, 1), p50_wet_day_mm=round(float(stats.get("p50wet") or 0), 2),
-        p95_mm=round(float(stats.get("p95") or 0), 2), antecedent_7d_mm=round(antecedent, 1),
+        sampling_percentile=round(pct, 1), p50_wet_day_mm=round(float(np.median(wet)) if wet.size else 0.0, 2),
+        p95_mm=round(float(np.percentile(clim, 95)), 2), antecedent_7d_mm=round(antecedent, 1),
         estimated_dilution_factor=round(dilution, 1), dry_window_suggestion=_dry_window(dates, mm),
     )
 
@@ -337,14 +370,46 @@ def _live_terrain(ctx: Dict[str, Any]) -> List[TerrainPoint]:
     return out
 
 
+S2_SR_START = dt.date(2017, 3, 28)  # COPERNICUS/S2_SR_HARMONIZED global availability
+
+
 def _s2_ndvi_collection(ee, geom):
     def to_ndvi(img):
         scl = img.select("SCL")
         clear = scl.neq(1).And(scl.neq(3)).And(scl.neq(8)).And(scl.neq(9)).And(scl.neq(10))
-        return img.updateMask(clear).normalizedDifference(["B8", "B4"]).rename("ndvi")
+        ndvi = img.updateMask(clear).normalizedDifference(["B8", "B4"]).rename("ndvi")
+        return ee.Image(ndvi.copyProperties(img, ["system:time_start"]))
 
     return (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED").filterBounds(geom)
             .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 70)).map(to_ndvi))
+
+
+def _landsat_ndvi_collection(ee, geom):
+    """Landsat 5/7/8 Collection 2 L2 NDVI — covers baselines before Sentinel-2 SR exists."""
+    def prep(nir, red):
+        def to_ndvi(img):
+            qa = img.select("QA_PIXEL")
+            clear = qa.bitwiseAnd(1 << 3).eq(0).And(qa.bitwiseAnd(1 << 4).eq(0))
+            sr = img.select([nir, red]).multiply(0.0000275).add(-0.2)
+            ndvi = sr.updateMask(clear).normalizedDifference([nir, red]).rename("ndvi")
+            return ee.Image(ndvi.copyProperties(img, ["system:time_start"]))
+        return to_ndvi
+
+    def col(asset, nir, red):
+        return ee.ImageCollection(asset).filterBounds(geom).map(prep(nir, red))
+
+    return (col("LANDSAT/LT05/C02/T1_L2", "SR_B4", "SR_B3")
+            .merge(col("LANDSAT/LE07/C02/T1_L2", "SR_B4", "SR_B3"))
+            .merge(col("LANDSAT/LC08/C02/T1_L2", "SR_B5", "SR_B4")))
+
+
+def _ndvi_window(ctx: Dict[str, Any]) -> Tuple[dt.date, dt.date]:
+    start = dt.date(ctx["baseline_date"].year, ctx["baseline_date"].month, 1) - dt.timedelta(days=180)
+    return start, ctx["meas_date"] + dt.timedelta(days=95)
+
+
+def _uses_landsat(ctx: Dict[str, Any]) -> bool:
+    return _ndvi_window(ctx)[0] < S2_SR_START
 
 
 def _live_ndvi(ctx: Dict[str, Any]) -> NdviEvidence:
@@ -352,9 +417,10 @@ def _live_ndvi(ctx: Dict[str, Any]) -> NdviEvidence:
 
     p = ctx["project"]
     geom = ee.Geometry.Point([p.longitude, p.latitude]).buffer(250)
-    s2 = _s2_ndvi_collection(ee, geom)
-    start = dt.date(ctx["baseline_date"].year, ctx["baseline_date"].month, 1) - dt.timedelta(days=180)
-    end = ctx["meas_date"] + dt.timedelta(days=95)
+    landsat = _uses_landsat(ctx)
+    coll = _landsat_ndvi_collection(ee, geom) if landsat else _s2_ndvi_collection(ee, geom)
+    scale = 30 if landsat else 20
+    start, end = _ndvi_window(ctx)
     months, cur = [], dt.date(start.year, start.month, 1)
     while cur <= end:
         nxt = dt.date(cur.year + (cur.month == 12), cur.month % 12 + 1, 1)
@@ -363,15 +429,15 @@ def _live_ndvi(ctx: Dict[str, Any]) -> NdviEvidence:
     feats = []
     for ms, me in months:
         val = ee.Dictionary(
-            s2.filterDate(ms.isoformat(), me.isoformat()).median()
-            .reduceRegion(ee.Reducer.mean(), geom, 20, bestEffort=True)
+            coll.filterDate(ms.isoformat(), me.isoformat()).median()
+            .reduceRegion(ee.Reducer.mean(), geom, scale, bestEffort=True)
         ).get("ndvi", -9)
         feats.append(ee.Feature(None, {"m": ms.isoformat(), "ndvi": val}))
     info = ee.FeatureCollection(feats).getInfo()["features"]
     series = [(f["properties"]["m"], float(f["properties"]["ndvi"])) for f in info
               if f["properties"].get("ndvi") is not None and float(f["properties"]["ndvi"]) > -1]
     if len(series) < 6:
-        raise RuntimeError("insufficient cloud-free Sentinel-2 months")
+        raise RuntimeError(f"insufficient cloud-free {'Landsat' if landsat else 'Sentinel-2'} months")
     return _ndvi_evidence(ctx, [s[0] for s in series], [round(s[1], 3) for s in series])
 
 
@@ -416,21 +482,99 @@ def _periods(ctx) -> Tuple[int, int, int, int]:
     return start - 3, start - 1, start, min(start + 2, 2024)
 
 
+def _hansen(ee) -> Tuple[Any, int]:
+    """First available Hansen GFC asset and the last loss year it covers (the year in its asset id)."""
+    for asset in HANSEN_ASSETS:
+        try:
+            gfc = ee.Image(asset)
+            gfc.bandNames().getInfo()
+            return gfc, int(re.search(r"change_(\d{4})_", asset).group(1))
+        except Exception:
+            continue
+    raise RuntimeError("Hansen GFC asset unavailable")
+
+
+# Hansen's 30% canopy threshold drops most open dry woodland (miombo, mopane), which inflates loss rates there.
+DRY_WOODLAND_TREE_COVER_PCT = 40.0
+
+
+def _canopy_threshold(mean_tree_cover_pct: float) -> int:
+    return 10 if mean_tree_cover_pct < DRY_WOODLAND_TREE_COVER_PCT else 30
+
+
+def _live_baseline_sampling(ctx: Dict[str, Any]) -> BaselineSampling:
+    import ee
+
+    gfc, last_year = _hansen(ee)
+    a0, a1 = ctx["ref_period"]
+    a1 = min(a1, last_year)
+    a0 = min(a0, a1)
+    sites: List[GeoPoint] = ctx["project_sites"] + ctx["control_sites"]
+    area = ee.Image.pixelArea().divide(1e4)
+    # lossyear is masked where no loss occurred; unmasked, standing forest would silently drop out of the sums.
+    tc, loss = gfc.select("treecover2000").unmask(0), gfc.select("lossyear").unmask(0)
+    # Forest standing at the start of the reference period = 2000 canopy minus loss before it.
+    standing = loss.eq(0).Or(loss.gte(a0 - 2000))
+    in_period = loss.gte(a0 - 2000).And(loss.lte(a1 - 2000))
+    land = area.updateMask(gfc.select("datamask").eq(1))  # exclude water / no-data from mean tree cover
+    bands = [tc.multiply(land).rename("tc_area"), land.rename("area")]
+    for th in (10, 30):
+        forest = tc.gte(th).And(standing)
+        bands += [forest.multiply(area).rename(f"forest{th}"),
+                  forest.And(in_period).multiply(area).rename(f"loss{th}")]
+    img = ee.Image.cat(bands)
+    fc = ee.FeatureCollection([
+        ee.Feature(ee.Geometry.Point([s.longitude, s.latitude]).buffer(SITE_RADIUS_KM * 1000, 50), {"k": i})
+        for i, s in enumerate(sites)])
+    res = img.reduceRegions(collection=fc, reducer=ee.Reducer.sum(), scale=30, tileScale=8).getInfo()["features"]
+    props = {f["properties"]["k"]: f["properties"] for f in res}
+
+    n_proj = len(ctx["project_sites"])
+    proj_props = [props[i] for i in range(n_proj)]
+    mean_tc = sum(float(p.get("tc_area") or 0) for p in proj_props) / max(sum(float(p.get("area") or 0) for p in proj_props), 1e-6)
+    th = _canopy_threshold(mean_tc)
+    return _baseline_from_sums(sites, n_proj, [(float(props[i].get(f"forest{th}") or 0), float(props[i].get(f"loss{th}") or 0))
+                                                for i in range(len(sites))], a0, a1, th, mean_tc)
+
+
+def _baseline_from_sums(sites: List[GeoPoint], n_proj: int, sums: List[Tuple[float, float]], a0: int, a1: int,
+                        th: int, mean_tc: float) -> BaselineSampling:
+    years = a1 - a0 + 1
+
+    def rate(forest: float, lost: float) -> float:
+        return round(lost / forest / years * 100, 2) if forest > 1 else 0.0
+
+    samples = [SiteLossSample(label=s.label, role=s.role, latitude=s.latitude, longitude=s.longitude,
+                              radius_km=SITE_RADIUS_KM, forest_ha=round(f, 1), loss_ha=round(l, 1), loss_rate_pct=rate(f, l))
+               for s, (f, l) in zip(sites, sums)]
+    proj, ref = sums[:n_proj], sums[n_proj:]
+    return BaselineSampling(
+        period=f"{a0}–{a1}", canopy_threshold_pct=th, mean_tree_cover_pct=round(mean_tc, 1), sites=samples,
+        project_rate_pct=rate(sum(f for f, _ in proj), sum(l for _, l in proj)),
+        reference_rate_pct=rate(sum(f for f, _ in ref), sum(l for _, l in ref)) if ref else None,
+    )
+
+
+def _fallback_baseline_sampling(ctx, prof: Dict[str, Any], buffer: BufferEvidence) -> BaselineSampling:
+    a0, a1 = ctx["ref_period"]
+    ref_rate = prof.get("reference_rate_pct")
+    sites: List[GeoPoint] = ctx["project_sites"] + (ctx["control_sites"] if ref_rate is not None else [])
+    n_proj = len(ctx["project_sites"])
+    site_area = math.pi * SITE_RADIUS_KM ** 2 * 100
+    proj_rate = float(prof.get("project_rate_pct", buffer.baseline_loss_rate_pct))
+    years = a1 - a0 + 1
+    sums = [(site_area, site_area * (proj_rate if i < n_proj else float(ref_rate)) / 100 * years)
+            for i in range(len(sites))]
+    th = int(prof.get("canopy_threshold_pct", 30))
+    return _baseline_from_sums(sites, n_proj, sums, a0, a1, th, float(prof.get("mean_tree_cover_pct", 50.0)))
+
+
 def _live_buffer(ctx: Dict[str, Any]) -> BufferEvidence:
     import ee
 
     p, R = ctx["project"], ctx["radius_km"]
     center = ee.Geometry.Point([p.longitude, p.latitude])
-    gfc = None
-    for asset in HANSEN_ASSETS:
-        try:
-            gfc = ee.Image(asset)
-            gfc.bandNames().getInfo()
-            break
-        except Exception:
-            gfc = None
-    if gfc is None:
-        raise RuntimeError("Hansen GFC asset unavailable")
+    gfc, _ = _hansen(ee)
     a0, a1, b0, b1 = _periods(ctx)
     loss = gfc.select("lossyear")
     area = ee.Image.pixelArea().divide(1e4)
@@ -438,6 +582,9 @@ def _live_buffer(ctx: Dict[str, Any]) -> BufferEvidence:
         (dt.date.today() - dt.timedelta(days=270)).isoformat(), dt.date.today().isoformat()).median()
     img = (loss.gte(a0 - 2000).And(loss.lte(a1 - 2000)).multiply(area).rename("pre")
            .addBands(loss.gte(b0 - 2000).And(loss.lte(b1 - 2000)).multiply(area).rename("post"))
+           .addBands(gfc.select("treecover2000").gte(30).multiply(area).rename("forest"))
+           .addBands(loss.gte(a0 - 2000).And(loss.lte(a1 - 2000)).And(gfc.select("treecover2000").gte(30))
+                     .multiply(area).rename("pre_forest"))
            .addBands(recent.multiply(area).rename("ndvi_area"))
            .addBands(area.updateMask(recent.mask()).rename("area")))
 
@@ -449,10 +596,13 @@ def _live_buffer(ctx: Dict[str, Any]) -> BufferEvidence:
     fc = ee.FeatureCollection([ee.Feature(ring_geom(i, o), {"k": k}) for k, (_, i, o) in enumerate(specs)])
     res = img.reduceRegions(collection=fc, reducer=ee.Reducer.sum(), scale=60, tileScale=4).getInfo()["features"]
     rings = []
+    total_pre = total_forest = 0.0
     for f in sorted(res, key=lambda f: f["properties"]["k"]):
         label, inner, outer = specs[f["properties"]["k"]]
         pr = f["properties"]
         pre, post = float(pr.get("pre") or 0), float(pr.get("post") or 0)
+        total_pre += float(pr.get("pre_forest") or 0)
+        total_forest += float(pr.get("forest") or 0)
         nd = float(pr.get("ndvi_area") or 0) / max(float(pr.get("area") or 1), 1e-6)
         rings.append(BufferRing(label=label, inner_km=inner, outer_km=outer, pre_period_loss_ha=round(pre, 1),
                                 post_period_loss_ha=round(post, 1),
@@ -473,6 +623,7 @@ def _live_buffer(ctx: Dict[str, Any]) -> BufferEvidence:
         project_radius_km=R, pre_period=f"{a0}–{a1}", post_period=f"{b0}–{b1}", rings=rings,
         inside_change_pct=rings[0].change_pct, peak_ring_label=peak.label, peak_change_pct=peak.change_pct,
         hotspot_lat=hlat, hotspot_lon=hlon, hotspot_distance_outside_km=round(mid - R, 2),
+        baseline_loss_rate_pct=round(total_pre / max(total_forest, 1e-6) / (a1 - a0 + 1) * 100, 2),
     )
 
 
@@ -651,10 +802,13 @@ def _fallback_buffer(ctx, prof: Dict[str, Any], rng) -> BufferEvidence:
     offset = float(prof.get("hotspot_offset_km", (peak.inner_km + peak.outer_km) / 2 - R))
     brg = float(prof.get("hotspot_bearing_deg", rng.integers(0, 8) * 45 + 22.5))
     hlat, hlon = destination_point(p.latitude, p.longitude, brg, R + offset)
+    total_area = sum(math.pi * (o ** 2 - i ** 2) * 100 for _, i, o in specs)
+    observed_rate = sum(r.pre_period_loss_ha for r in rings) / total_area / (a1 - a0 + 1) * 100
     return BufferEvidence(
         project_radius_km=R, pre_period=f"{a0}–{a1}", post_period=f"{b0}–{b1}", rings=rings,
         inside_change_pct=rings[0].change_pct, peak_ring_label=peak.label, peak_change_pct=peak.change_pct,
         hotspot_lat=hlat, hotspot_lon=hlon, hotspot_distance_outside_km=round(offset, 2),
+        baseline_loss_rate_pct=round(float(prof.get("baseline_loss_rate_pct", observed_rate)), 2),
     )
 
 
@@ -667,6 +821,7 @@ _DATASETS = {
     "Elevation & slope": "SRTM 1-arcsec DEM (USGS/SRTMGL1_003)",
     "Vegetation NDVI": "Sentinel-2 L2A SR (COPERNICUS/S2_SR_HARMONIZED)",
     "Buffer-ring loss": "Hansen Global Forest Change + Sentinel-2 NDVI",
+    "Multi-site baseline loss": "Hansen Global Forest Change (treecover2000 + lossyear) at every project & reference site",
 }
 
 
@@ -681,40 +836,58 @@ def verify_filing(extracted: ExtractedFilingData, profile: Optional[Dict[str, An
     fallback_mode = "BENCHMARK_REPLAY" if profile else "DETERMINISTIC_FALLBACK"
     fb_detail = ("Curated benchmark telemetry (golden case replay)" if profile
                  else "Earth Engine credentials not mounted — seeded deterministic telemetry")
-    from services.gemini_extractor import is_filing_pre_2015
     datasets = dict(_DATASETS)
-    if is_filing_pre_2015(extracted):
-        datasets["Vegetation NDVI"] = "Landsat 5/7 SR (LANDSAT/LT05 + LE07)"
-        datasets["Buffer-ring loss"] = "Hansen Global Forest Change + Landsat 5/7 NDVI"
+    if _uses_landsat(ctx):
+        datasets["Vegetation NDVI"] = "Landsat 5/7/8 C2 L2 SR (LANDSAT/LT05 + LE07 + LC08)"
     provenance: List[LayerProvenance] = []
 
-    def run(layer: str, live_fn, fb_fn):
-        ds_name = datasets[layer]
-        if live:
-            try:
-                result = live_fn(ctx)
-                provenance.append(LayerProvenance(layer=layer, dataset=ds_name, mode="LIVE",
-                                                  detail="Queried live from Earth Engine"))
-                return result
-            except Exception as exc:
-                logger.warning("EE layer %s failed, using fallback: %s", layer, exc)
-                detail = f"Live query failed ({exc.__class__.__name__}); fallback telemetry"
-                provenance.append(LayerProvenance(layer=layer, dataset=ds_name, mode=fallback_mode, detail=detail))
-                return fb_fn()
-        provenance.append(LayerProvenance(layer=layer, dataset=ds_name, mode=fallback_mode, detail=fb_detail))
-        return fb_fn()
-
-    rainfall = run("Precipitation", _live_rainfall, lambda: _fallback_rainfall(ctx, profile.get("rain", {}), rng))
-    wind = None
+    layers = [("Precipitation", _live_rainfall, lambda: _fallback_rainfall(ctx, profile.get("rain", {}), rng))]
     if not ctx["is_carbon"] and ctx["air_sensor"] is not None:
-        wind = run("Wind vectors", _live_wind, lambda: _fallback_wind(ctx, profile.get("wind", {}), rng))
-    terrain = run("Elevation & slope", _live_terrain, lambda: _fallback_terrain(ctx, profile.get("terrain", {}), rng))
-    ndvi = run("Vegetation NDVI", _live_ndvi, lambda: _fallback_ndvi(ctx, profile.get("ndvi", {}), rng))
-    buffer = run("Buffer-ring loss", _live_buffer, lambda: _fallback_buffer(ctx, profile.get("buffer", {}), rng))
+        layers.append(("Wind vectors", _live_wind, lambda: _fallback_wind(ctx, profile.get("wind", {}), rng)))
+    layers += [
+        ("Elevation & slope", _live_terrain, lambda: _fallback_terrain(ctx, profile.get("terrain", {}), rng)),
+        ("Vegetation NDVI", _live_ndvi, lambda: _fallback_ndvi(ctx, profile.get("ndvi", {}), rng)),
+        ("Buffer-ring loss", _live_buffer, lambda: _fallback_buffer(ctx, profile.get("buffer", {}), rng)),
+    ]
+    results: Dict[str, Any] = {}
+    if ctx["is_redd"]:
+        layers.append(("Multi-site baseline loss", _live_baseline_sampling,
+                       lambda: _fallback_baseline_sampling(ctx, profile.get("baseline", {}), results["Buffer-ring loss"])))
+    site = ctx["water_sensor"] or p
 
-    if prefer_live:
-        site = ctx["water_sensor"] or p
-        rainfall.bigquery_corroboration = _bigquery_gsod_corroboration(site.latitude, site.longitude, ctx["rain_date"])
+    # Live layers are independent network calls: run them concurrently. Fallbacks stay sequential
+    # (in fixed order) so the shared seeded RNG yields identical benchmark telemetry every run.
+    live_out: Dict[str, Any] = {}
+    gsod = None
+    with ThreadPoolExecutor(max_workers=len(layers) + 1) as pool:
+        futures = {name: pool.submit(fn, ctx) for name, fn, _ in layers} if live else {}
+        gsod_future = (pool.submit(_bigquery_gsod_corroboration, site.latitude, site.longitude, ctx["rain_date"])
+                       if prefer_live else None)
+        for name, fut in futures.items():
+            try:
+                live_out[name] = fut.result()
+            except Exception as exc:
+                logger.warning("EE layer %s failed, using fallback: %s", name, exc)
+                live_out[name] = exc
+        if gsod_future is not None:
+            gsod = gsod_future.result()
+
+    for name, _, fb_fn in layers:
+        ds_name = datasets[name]
+        out = live_out.get(name)
+        if out is not None and not isinstance(out, Exception):
+            provenance.append(LayerProvenance(layer=name, dataset=ds_name, mode="LIVE",
+                                              detail="Queried live from Earth Engine"))
+            results[name] = out
+            continue
+        detail = f"Live query failed ({out.__class__.__name__}); fallback telemetry" if isinstance(out, Exception) else fb_detail
+        provenance.append(LayerProvenance(layer=name, dataset=ds_name, mode=fallback_mode, detail=detail))
+        results[name] = fb_fn()
+
+    rainfall, wind = results["Precipitation"], results.get("Wind vectors")
+    terrain, ndvi, buffer = results["Elevation & slope"], results["Vegetation NDVI"], results["Buffer-ring loss"]
+
+    rainfall.bigquery_corroboration = gsod
     if rainfall.bigquery_corroboration is None and profile.get("rain", {}).get("gsod_note"):
         rainfall.bigquery_corroboration = profile["rain"]["gsod_note"]
 
@@ -741,7 +914,8 @@ def verify_filing(extracted: ExtractedFilingData, profile: Optional[Dict[str, An
 
     return SatelliteEvidence(
         filing_mode=extracted.filing_mode, provenance=provenance, rainfall=rainfall, ndvi=ndvi, wind=wind,
-        terrain=terrain, buffer=buffer, recommended_dispatch_lat=lat, recommended_dispatch_lon=lon,
+        terrain=terrain, buffer=buffer, baseline_sampling=results.get("Multi-site baseline loss"),
+        recommended_dispatch_lat=lat, recommended_dispatch_lon=lon,
         recommended_dispatch_rationale=why,
     )
 

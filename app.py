@@ -38,17 +38,26 @@ except ImportError:
 from schemas import ExtractedFilingData, FullAuditReport, SatelliteEvidence  # noqa: E402
 from services import adc_status  # noqa: E402
 from services.earth_engine_verifier import circle_polygon, init_earth_engine, verify_filing, wedge_polygon  # noqa: E402
+from services.earth_engine_verifier import redd_baseline_claim  # noqa: E402
 from services.gemini_extractor import (  # noqa: E402
     build_audit_report,
+    claim_limit_breach,
     compass,
     extract_filing,
+    flood_dilution_applies,
     gemini_available,
     gemini_status,
     get_sensor_label,
     is_filing_pre_2015,
     is_redd_project,
     is_surface_effluent_concentration,
+    limit_text,
+    observed_project_loss_rate,
+    primary_eia_claim,
+    project_terrain,
 )
+
+CLEARED_VERDICTS = ("✅ COMPLIANCE VERIFIED: STATUTORY LIMITS RESPECTED", "VERIFIED BASELINE INTEGRITY")
 from services.pubsub_dispatcher import build_payload, publish_dispatch, topic_path  # noqa: E402
 from services.storage_service import bucket_name, stage_pdf, store_audit_artifact  # noqa: E402
 
@@ -270,6 +279,14 @@ border:1px solid rgba(251,191,36,.35);}
 .tt-foot-lbl{font-family:'Space Grotesk',sans-serif;font-size:.74rem;font-weight:700;color:#94a3b8;letter-spacing:.04em;}
 .tt-metric-row-footer.fail .tt-foot-lbl{color:#fda4af;}
 .tt-metric-row-footer.fail .tt-foot-val b{color:#f87171!important;background:rgba(244,63,94,.18);padding:2px 8px;border-radius:5px;border:1px solid rgba(244,63,94,.45);font-family:'JetBrains Mono',monospace;font-size:.81rem;}
+.tt-sbs-col.actual.warn{border-left:4px solid #fbbf24;border-color:rgba(251,191,36,.35);background:linear-gradient(145deg,rgba(251,191,36,.10),rgba(10,16,30,.85));}
+.tt-sbs-col.actual.warn .tt-sbs-val code{color:#fcd34d!important;}
+.tt-sbs-status.warn{background:rgba(251,191,36,.18);color:#fcd34d;border:1px solid rgba(251,191,36,.45);}
+.tt-metric-row.warn{border-left-color:#fbbf24;background:linear-gradient(135deg,rgba(251,191,36,.08),rgba(2,6,23,.65));border-color:rgba(251,191,36,.3);}
+.tt-m-badge.warn{background:rgba(251,191,36,.2);color:#fcd34d;border:1px solid rgba(251,191,36,.45);}
+.tt-side-cell.reality.warn{border-left:3px solid #fbbf24;}
+.tt-metric-row-footer.warn .tt-foot-lbl{color:#fcd34d;}
+.tt-metric-row-footer.warn .tt-foot-val b{color:#fbbf24!important;background:rgba(251,191,36,.18);padding:2px 8px;border-radius:5px;border:1px solid rgba(251,191,36,.45);font-family:'JetBrains Mono',monospace;font-size:.81rem;}
 .tt-metric-row-footer.pass .tt-foot-lbl{color:#6ee7b7;}
 .tt-metric-row-footer.pass .tt-foot-val b{color:#34d399!important;background:rgba(52,211,153,.18);padding:2px 8px;border-radius:5px;border:1px solid rgba(52,211,153,.45);font-family:'JetBrains Mono',monospace;font-size:.81rem;}
 
@@ -674,8 +691,7 @@ def chart_dilution(report: FullAuditReport, ev: SatelliteEvidence) -> Optional[g
               if is_surface_effluent_concentration(c)), None)
     if not c or c.claimed_control_or_limit_value <= 0:
         return None
-    # Only render flood dilution chart if precipitation exceeds 25 mm AND percentile >= 90th
-    if ev.rainfall.sampling_day_mm <= 25.0 or ev.rainfall.sampling_percentile < 90.0:
+    if not flood_dilution_applies(c, ev.rainfall):
         return None
     corrected = c.claimed_project_value * ev.rainfall.estimated_dilution_factor
     gov_body = getattr(c, "governing_body", "") or getattr(report.extracted_data, "governing_body", "") or "Statutory Standards"
@@ -699,6 +715,11 @@ def chart_ndvi(ev: SatelliteEvidence, x: Optional[ExtractedFilingData] = None) -
                 secondary_y=True, hovertemplate="%{x|%b %Y}: %{y:.0f} mm<extra></extra>")
     fig.add_scatter(x=n.dates, y=n.ndvi, mode="lines", name=sensor_lbl,
                     line=dict(color=EMERALD, width=2, shape="spline"), secondary_y=False)
+    fig.update_yaxes(title_text="NDVI", secondary_y=False)
+    fig.update_yaxes(title_text="mm/mo", secondary_y=True, showgrid=False)
+    if is_redd_project(x):
+        # REDD+ filings credit avoided loss, not dated NDVI gains, so there are no filed NDVI points to plot.
+        return _style(fig, 270, f"Vegetation Seasonality vs Rainfall ({sensor_short})")
     like_x = f"{n.baseline_date[:4] if n.measurement_date[5:7] >= n.baseline_date[5:7] else int(n.baseline_date[:4]) + 1}-{n.measurement_date[5:7]}-15"
     fig.add_scatter(x=[n.baseline_date], y=[n.baseline_ndvi], mode="markers",
                     marker=dict(size=12, color=CYAN, line=dict(color="#0f172a", width=2)),
@@ -706,13 +727,10 @@ def chart_ndvi(ev: SatelliteEvidence, x: Optional[ExtractedFilingData] = None) -
     fig.add_scatter(x=[like_x], y=[n.like_season_baseline_ndvi], mode="markers",
                     marker=dict(size=12, color=TEAL, line=dict(color="#0f172a", width=2)),
                     name=f"Season-Matched Baseline {n.like_season_baseline_ndvi:.2f}", secondary_y=False)
-    # Measurement point
     fig.add_scatter(x=[n.measurement_date], y=[n.measurement_ndvi], mode="markers",
                     marker=dict(size=18, color="#ef4444", symbol="circle", line=dict(color="#ffffff", width=2.5)),
-                    name=f"Filed Measurement {n.measurement_ndvi:.2f} (Post-Monsoon)", secondary_y=False)
-    fig.update_yaxes(title_text="NDVI", secondary_y=False)
-    fig.update_yaxes(title_text="mm/mo", secondary_y=True, showgrid=False)
-    return _style(fig, 270, f"Canopy Greening vs Monsoon Rainfall ({sensor_short})")
+                    name=f"Filed Measurement {n.measurement_ndvi:.2f} (Post-Rainy Season)", secondary_y=False)
+    return _style(fig, 270, f"Canopy Greening vs Rainy-Season Rainfall ({sensor_short})")
 
 
 def chart_wind(ev: SatelliteEvidence) -> go.Figure:
@@ -947,15 +965,13 @@ def calculate_discrepancy(a: Dict[str, Any]) -> float:
     if not getattr(x, "is_satellite_verifiable", True):
         return 0.0
     if x.filing_mode == "EIA_CLEARANCE":
-        c = next((claim for claim in x.sampling_claims if is_surface_effluent_concentration(claim)), None) or (x.sampling_claims[0] if x.sampling_claims else None)
+        c = primary_eia_claim(x)
         if not c:
             return 0.0
         filed_num = c.claimed_project_value
         limit_num = c.claimed_control_or_limit_value
-        is_conc = is_surface_effluent_concentration(c)
-        flood_dilution_trigger = is_conc and (ev.rainfall.sampling_day_mm > 25.0) and (ev.rainfall.sampling_percentile >= 90.0)
 
-        if flood_dilution_trigger:
+        if flood_dilution_applies(c, ev.rainfall):
             dilution = ev.rainfall.estimated_dilution_factor
             true_num = filed_num * dilution
             if limit_num > 0 and true_num > limit_num:
@@ -968,7 +984,9 @@ def calculate_discrepancy(a: Dict[str, Any]) -> float:
         else:
             if limit_num > 0 and filed_num > limit_num:
                 return ((filed_num - limit_num) / limit_num) * 100.0
-            # If filed_value <= statutory_limit and no flood dilution, audit variance is 0.0%
+            lower = c.statutory_lower_limit
+            if lower is not None and lower > 0 and filed_num < lower:
+                return ((lower - filed_num) / lower) * 100.0
             return 0.0
     else:
         seasonal = ev.ndvi.seasonal_artifact_pct
@@ -1081,7 +1099,8 @@ def get_forensic_ledger_entries(a: Dict[str, Any]) -> List[Dict[str, Any]]:
         ]
     is_carbon = x.filing_mode == "CARBON_OFFSET"
     disc = calculate_discrepancy(a)
-    is_fraud = disc > 15.0
+    chk_ok = [c.status == "PASSED" for c in report.forensic_checks] + [True] * 3
+    is_fraud = not chk_ok[0]
     entries: List[Dict[str, Any]] = []
 
     if is_carbon:
@@ -1089,26 +1108,36 @@ def get_forensic_ledger_entries(a: Dict[str, Any]) -> List[Dict[str, Any]]:
         sensor_name = get_sensor_label(x, ev)
         sensor_short = get_sensor_label(x, ev, short=True)
         if is_redd_project(x):
-            c_defor = next((c for c in x.sampling_claims if any(k in c.parameter.lower() for k in ("deforestation", "loss rate", "baseline", "counterfactual", "redd"))), None)
+            c_defor = redd_baseline_claim(x.sampling_claims)
             claimed_rate = c_defor.claimed_control_or_limit_value if (c_defor and c_defor.claimed_control_or_limit_value > 0) else (c_defor.claimed_project_value if c_defor else 3.9)
             unit_str = c_defor.unit if c_defor else "%/yr"
             sampling_dt = c_defor.sampling_date if c_defor else (ev.ndvi.measurement_date if (ev and hasattr(ev, "ndvi")) else "Filing Baseline")
-            sat_loss = getattr(ev.buffer, "baseline_loss_rate_pct", 0.4) if (ev and hasattr(ev, "buffer")) else 0.4
+            sat_loss = observed_project_loss_rate(ev)
+            bs = ev.baseline_sampling
+            if bs:
+                n_sites = sum(s.role == "PROJECT_SITE" for s in bs.sites)
+                sat_src = f"Hansen GFC, {bs.period}, {n_sites} project site{'s' if n_sites != 1 else ''}, canopy ≥{bs.canopy_threshold_pct}%"
+            else:
+                sat_src = f"Hansen GFC, {ev.buffer.pre_period}"
+            period_txt = f" for {c_defor.reference_period}" if (c_defor and c_defor.reference_period) else ""
+            claim_val = f"Reported Avoided Deforestation Baseline: {claimed_rate:.1f}{unit_str}{period_txt} (Filed {sampling_dt})"
+            sat_val = f"{sat_loss:.2f}%/yr Historical Forest Loss ({sat_src})"
 
             if is_fraud:
                 entries.append({
                     "metric_label": "1. Avoided Deforestation Baseline vs Historical Satellite Truth",
-                    "claim_val": f"Reported Avoided Deforestation Baseline: {claimed_rate:.1f}{unit_str} (Claimed Counterfactual · Date: {sampling_dt})",
-                    "sat_val": f"{sat_loss:.1f}{unit_str} Historical Baseline Loss ({sensor_name} & Hansen GFC)",
-                    "variance_val": f"+{claimed_rate - sat_loss:.1f}%/yr Baseline Inflation (Historical satellite loss rate is {sat_loss:.1f}{unit_str})",
+                    "claim_val": claim_val,
+                    "sat_val": sat_val,
+                    "variance_val": f"+{claimed_rate - sat_loss:.1f}%/yr Baseline Inflation ({claimed_rate / max(sat_loss, 0.05):.1f}× observed loss)",
                     "passed": False,
                 })
             else:
                 entries.append({
                     "metric_label": "1. Avoided Deforestation Baseline vs Historical Satellite Truth",
-                    "claim_val": f"Reported Avoided Deforestation Baseline: {claimed_rate:.1f}{unit_str} (Date: {sampling_dt})",
-                    "sat_val": f"{sat_loss:.1f}{unit_str} Historical Baseline Loss (Corroborated by {sensor_name})",
-                    "variance_val": "Reported Avoided Deforestation Baseline Validated",
+                    "claim_val": claim_val,
+                    "sat_val": sat_val,
+                    "variance_val": ("Filed rate is below observed loss — conservative for the sampled areas"
+                                     if claimed_rate <= sat_loss - 0.5 else "Consistent with observed historical loss"),
                     "passed": True,
                 })
         else:
@@ -1133,49 +1162,52 @@ def get_forensic_ledger_entries(a: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "passed": True,
                 })
 
-        # 2. Control Plot Topography
+        # 2. Control Plot Comparability (terrain + deforestation pressure)
+        label2 = "2. Reference Control Plot Comparability & Terrain"
         ctrl = next((t for t in ev.terrain if t.role == "CONTROL_SITE"), None)
-        proj = next((t for t in ev.terrain if t.role == "PROJECT_SITE"), None)
-        target_pt = ctrl or proj
-        if target_pt:
-            ctrl_elev = target_pt.claimed_elevation_m
-            # Topography / Null Value Handler:
-            if (ctrl_elev is None or ctrl_elev == 0.0) and target_pt.srtm_elevation_m > 50.0:
-                sat_elev_str = f"{target_pt.srtm_elevation_m:.0f}"
-                sat_slope_str = f"{target_pt.slope_deg:.1f}"
-                finding = f"Baseline Topography Not Disclosed — Relying on Independent Satellite DEM (SRTM: {sat_elev_str}m, {sat_slope_str}° Slope)"
-                entries.append({
-                    "metric_label": "2. Reference Control Plot Comparability & Terrain",
-                    "claim_val": "Baseline Topography Not Disclosed (Elevation Omitted in Filing)",
-                    "sat_val": f"SRTM DEM: {sat_elev_str}m Elevation, {sat_slope_str}° Slope",
-                    "variance_val": finding,
-                    "passed": True,
-                })
-            elif ctrl and proj:
-                ds = ctrl.slope_deg - proj.slope_deg
-                de = ctrl.srtm_elevation_m - (ctrl_elev or 0.0)
-                ctrl_elev_display = f"{ctrl.claimed_elevation_m:.0f} m Elevation" if (ctrl.claimed_elevation_m is not None and ctrl.claimed_elevation_m > 0) else "Not Disclosed"
-                slope_fraud = abs(ds) >= 15 or (ctrl.distance_to_road_km is not None and ctrl.distance_to_road_km < 0.5)
-                if slope_fraud:
-                    entries.append({
-                        "metric_label": "2. Reference Control Plot Comparability & Terrain",
-                        "claim_val": f"{ctrl_elev_display} (Declared Equivalent Reference Plot)",
-                        "sat_val": f"{ctrl.srtm_elevation_m:.0f} m Elevation, {ctrl.slope_deg:.1f}° Slope (Steep Ridge Beside Haul Road)",
-                        "variance_val": f"{de:+.0f} m Elevation / {ds:+.0f}° Slope Mismatch (Biased Baseline Inflates Credits)",
-                        "passed": False,
-                    })
-                else:
-                    entries.append({
-                        "metric_label": "2. Reference Control Plot Comparability & Terrain",
-                        "claim_val": ctrl_elev_display,
-                        "sat_val": f"{ctrl.srtm_elevation_m:.0f} m Elevation, {ctrl.slope_deg:.1f}° Slope",
-                        "variance_val": "Topographically Equivalent (Control Plot Validated)",
-                        "passed": True,
-                    })
+        proj = project_terrain(ev)
+        bs = ev.baseline_sampling
+        if ctrl is None or proj is None:
+            entries.append({
+                "metric_label": label2,
+                "claim_val": "No reference / control plot coordinates disclosed",
+                "sat_val": "Comparability test not possible",
+                "variance_val": "Counterfactual baseline is unverifiable",
+                "passed": chk_ok[1],
+            })
+        else:
+            claimed = ctrl.claimed_elevation_m if (ctrl.claimed_elevation_m or 0) > 0 else None
+            ds = ctrl.slope_deg - proj.slope_deg
+            dproj = ctrl.srtm_elevation_m - proj.srtm_elevation_m
+            road = ctrl.distance_to_road_km
+            near_road = road is not None and road < 0.5
+            claim_val = (f"Reference '{ctrl.label}' declared comparable (claimed {claimed:.0f} m)" if claimed
+                         else f"Reference '{ctrl.label}' · Baseline Topography Not Disclosed")
+            sat_val = (f"Control {ctrl.srtm_elevation_m:.0f} m / {ctrl.slope_deg:.1f}° vs {proj.label if 'mean' in proj.label else 'project'} "
+                       f"{proj.srtm_elevation_m:.0f} m / {proj.slope_deg:.1f}° (SRTM)"
+                       + (f" · control {road * 1000:.0f} m from a road" if road is not None else ""))
+            reasons = []
+            if bs and bs.reference_rate_pct is not None:
+                pr, rr = bs.project_rate_pct, bs.reference_rate_pct
+                ratio = rr / max(pr, 0.05)
+                sat_val = f"Forest loss {bs.period}: reference {rr:.2f}%/yr vs project {pr:.2f}%/yr ({ratio:.1f}×) · {sat_val}"
+                if ratio >= 1.5 and rr - pr >= 0.3:
+                    reasons.append(f"Reference area deforested {ratio:.1f}× faster than the project area")
+            if abs(ds) >= 7 or abs(dproj) > 150 or near_road:
+                reasons.append(f"terrain differs ({dproj:+.0f} m / {ds:+.1f}° vs project{', beside a road' if near_road else ''})")
+            if claimed and abs(ctrl.srtm_elevation_m - claimed) > 150:
+                reasons.append(f"claimed elevation off by {ctrl.srtm_elevation_m - claimed:+.0f} m")
+            if chk_ok[1]:
+                variance = "Comparable terrain" + (" and deforestation pressure" if bs and bs.reference_rate_pct is not None else "")
+            else:
+                variance = ("; ".join(reasons) or "Control plot not comparable") + " — baseline may overstate the threat"
+                variance = variance[0].upper() + variance[1:]
+            entries.append({"metric_label": label2, "claim_val": claim_val, "sat_val": sat_val,
+                            "variance_val": variance, "passed": chk_ok[1]})
 
         # 3. Buffer Deforestation Leakage
         peak = ev.buffer.peak_change_pct
-        if peak >= 25:
+        if not chk_ok[2]:
             entries.append({
                 "metric_label": "3. Surrounding Buffer & Deforestation Leakage",
                 "claim_val": "0.0% Displaced Deforestation (No Leakage Declared)",
@@ -1195,21 +1227,19 @@ def get_forensic_ledger_entries(a: Dict[str, Any]) -> List[Dict[str, Any]]:
     else:
         # EIA Case
         # 1. Parameter Concentration & Baseline Compliance
-        c = next((claim for claim in x.sampling_claims if is_surface_effluent_concentration(claim)), None) or (x.sampling_claims[0] if x.sampling_claims else None)
-        claimed_num = c.claimed_project_value if c else 0.04
-        unit_str = c.unit if c else "mg/L"
-        limit_num = c.claimed_control_or_limit_value if (c and c.claimed_control_or_limit_value > 0) else 0.10
-        param_name = c.parameter.split(" at ")[0] if c else "River Effluent Cr-VI"
+        c = primary_eia_claim(x)
+        claimed_num = c.claimed_project_value if c else 0.0
+        unit_str = c.unit if c else ""
+        limit_num = c.claimed_control_or_limit_value if (c and c.claimed_control_or_limit_value > 0) else 0.0
+        limit_str = limit_text(c) if c else "not disclosed"
+        param_name = c.parameter.split(" at ")[0] if c else "Sampled parameter"
         sampling_dt = c.sampling_date if c else ev.rainfall.sampling_date
         gov_body = getattr(c, "governing_body", "") or getattr(x, "governing_body", "") or "Statutory Authority"
-        is_conc = is_surface_effluent_concentration(c)
-        flood_dilution_trigger = is_conc and (ev.rainfall.sampling_day_mm > 25.0) and (ev.rainfall.sampling_percentile >= 90.0)
-
-        audit_variance = calculate_discrepancy(a)
-        is_compliant = (audit_variance <= 10.0 and claimed_num <= limit_num)
+        flood_dilution_trigger = flood_dilution_applies(c, ev.rainfall)
+        is_compliant = chk_ok[0]
 
         if is_compliant:
-            claim_val = f"Asserted Compliant (Limit: {limit_num:g} {unit_str} under {gov_body} standards) · Sampled: {sampling_dt}"
+            claim_val = f"Asserted Compliant (Limit: {limit_str} under {gov_body} standards) · Sampled: {sampling_dt}"
             if ev.rainfall.sampling_day_mm == 0.0:
                 sat_val = f"{claimed_num:g} {unit_str} — Earth Engine climate data (CHIRPS) confirms sampling occurred during normal dry-weather conditions (0.0 mm rain). No flood dilution detected. Baseline is representative."
             elif ev.rainfall.sampling_percentile < 75.0:
@@ -1235,14 +1265,21 @@ def get_forensic_ledger_entries(a: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "variance_val": f"+{variance_pct:.0f}% Discrepancy ({ratio:.1f}× permissible threshold under {gov_body} standards)",
                 "passed": False,
             })
-        else:
-            excess_pct = ((claimed_num - limit_num) / limit_num) * 100.0 if limit_num > 0 else 0.0
-            ratio = claimed_num / limit_num if limit_num > 0 else 1.0
+        elif claim_limit_breach(c) is None:
             entries.append({
                 "metric_label": f"1. {param_name} & Regulatory Compliance",
-                "claim_val": f"Reported {claimed_num:g} {unit_str} (Limit: {limit_num:g} {unit_str} under {gov_body} standards) · Sampled: {sampling_dt}",
+                "claim_val": f"Reported {claimed_num:g} {unit_str} (No statutory limit disclosed) · Sampled: {sampling_dt}",
+                "sat_val": f"{ev.rainfall.sampling_day_mm:.1f} mm rain on sampling day (CHIRPS)",
+                "variance_val": "Compliance cannot be confirmed — limit not disclosed in filing",
+                "passed": False,
+            })
+        else:
+            disc_pct = calculate_discrepancy(a)
+            entries.append({
+                "metric_label": f"1. {param_name} & Regulatory Compliance",
+                "claim_val": f"Reported {claimed_num:g} {unit_str} (Limit: {limit_str} under {gov_body} standards) · Sampled: {sampling_dt}",
                 "sat_val": f"{claimed_num:g} {unit_str} (Normal Flow Confirmed)",
-                "variance_val": f"+{excess_pct:.0f}% Discrepancy ({ratio:.1f}× permissible threshold under {gov_body} standards)",
+                "variance_val": f"{disc_pct:.0f}% outside permissible limit {limit_str} (self-reported in filing)",
                 "passed": False,
             })
 
@@ -1334,42 +1371,50 @@ def render_plain_english_comparison(a: Dict[str, Any]) -> None:
     is_carbon = x.filing_mode == "CARBON_OFFSET"
     disc = calculate_discrepancy(a)
 
-    if not is_carbon:
-        c = next((claim for claim in x.sampling_claims if is_surface_effluent_concentration(claim)), None) or (x.sampling_claims[0] if x.sampling_claims else None)
-        claimed_num = c.claimed_project_value if c else 0.04
-        limit_num = c.claimed_control_or_limit_value if (c and c.claimed_control_or_limit_value > 0) else 0.10
-        is_compliant = (disc <= 10.0 and claimed_num <= limit_num)
-    else:
-        is_compliant = disc <= 10.0
+    # The backend verdict is the single source of truth; the UI only presents it.
+    is_compliant = report.verdict_banner in CLEARED_VERDICTS
+    is_fraud = report.forensic_checks[0].status != "PASSED" if report.forensic_checks else not is_compliant
+    score = report.integrity_score
+    provisional = getattr(report, "provisional_layers", [])
 
-    is_fraud = not is_compliant
-
-    # Dynamic Integrity Score & Banner sync
-    if is_compliant:
-        score = max(report.integrity_score, 98 if disc == 0.0 else 96)
-        report.integrity_score = score
-        report.verdict_banner = "✅ COMPLIANCE VERIFIED: STATUTORY LIMITS RESPECTED"
-    else:
-        score = report.integrity_score
+    if provisional:
+        st.error(
+            "**Provisional result — synthetic data.** Live satellite queries were unavailable or failed for: "
+            f"{', '.join(provisional)}. These layers use seeded fallback telemetry, so no enforcement action "
+            "is issued. Re-run with live Earth Engine access before relying on this verdict."
+        )
 
     # Executive Verdict & Gauge Header
     v_col1, v_col2 = st.columns([2.5, 1.0], gap="large")
     with v_col1:
         if is_compliant:
             cls = "verified"
-            verdict_text = "✅ COMPLIANCE VERIFIED: STATUTORY LIMITS RESPECTED"
-            badge_label = "AUDIT PASSED · COMPLIANT"
-            pubsub_msg = "⚡ AUTOMATED REGULATORY CLEARANCE ISSUED: Filing meets statutory baseline standards."
+            n_flagged = sum(c.status != "PASSED" for c in report.forensic_checks)
+            flag_txt = f" {n_flagged} check{'s' if n_flagged != 1 else ''} flagged for review below." if n_flagged else ""
+            if is_carbon:
+                verdict_text = "✅ BASELINE CONSISTENT WITH SATELLITE HISTORY"
+                badge_label = "NO MATERIAL DISCREPANCY · SCREENING RESULT"
+                cleared_msg = ("No material discrepancy between the filed baseline and satellite history at the sampled "
+                               "sites. This is an independent screening result, not registry approval." + flag_txt)
+            else:
+                verdict_text = report.verdict_banner
+                badge_label = "AUDIT PASSED · COMPLIANT"
+                cleared_msg = "Filing meets the statutory limits it reports, under normal sampling conditions." + flag_txt
+            pubsub_msg = "No action issued — provisional result." if provisional else cleared_msg
         else:
             cls = "spin" if report.verdict_banner.startswith("HIGH") else "moderate"
             verdict_text = "Critical Baseline Discrepancy Detected" if report.verdict_banner.startswith("HIGH") else "Moderate Baseline Discrepancy Detected"
             badge_label = "AUDIT FAILED · NON-COMPLIANT"
             d_lat = report.dispatch_action.recommended_coordinates_lat or (x.coordinates[0].latitude if x.coordinates else 0.0)
             d_lon = report.dispatch_action.recommended_coordinates_lon or (x.coordinates[0].longitude if x.coordinates else 0.0)
-            if is_carbon:
-                pubsub_msg = f"Field Alert Published (Cloud Pub/Sub): Registry credit issuance placed on hold. Inspection notice routed to field rangers at coordinates `[{d_lat:.4f}, {d_lon:.4f}]`."
+            if provisional:
+                pubsub_msg = "No field alert issued — provisional result based on synthetic fallback telemetry."
+            elif is_carbon:
+                pubsub_msg = ("Recommended action: hold registry credit issuance pending re-verification"
+                              + (f" and send field rangers to coordinates `[{d_lat:.4f}, {d_lon:.4f}]`."
+                                 if report.forensic_checks[2].status != "PASSED" else "."))
             else:
-                pubsub_msg = f"Field Alert Published (Cloud Pub/Sub): Unannounced re-sampling order dispatched to regional environmental inspectors at coordinates `[{d_lat:.4f}, {d_lon:.4f}]`."
+                pubsub_msg = f"Recommended action: unannounced re-sampling by regional environmental inspectors at coordinates `[{d_lat:.4f}, {d_lon:.4f}]`."
 
         H(f'<div class="tt-verdict {cls}"><div class="k">Compliance Audit Verdict · {badge_label}</div><div class="t">{E(verdict_text)}</div></div>')
         if is_compliant:
@@ -1384,11 +1429,14 @@ def render_plain_english_comparison(a: Dict[str, Any]) -> None:
     if is_carbon:
         sensor_short = get_sensor_label(x, ev, short=True)
         if is_redd_project(x):
-            c_defor = next((c for c in x.sampling_claims if any(k in c.parameter.lower() for k in ("deforestation", "loss rate", "baseline", "counterfactual", "redd"))), None)
+            c_defor = redd_baseline_claim(x.sampling_claims)
             claimed_rate = c_defor.claimed_control_or_limit_value if (c_defor and c_defor.claimed_control_or_limit_value > 0) else (c_defor.claimed_project_value if c_defor else 3.9)
             unit_str = c_defor.unit if c_defor else "%/yr"
             sampling_dt = c_defor.sampling_date if c_defor else (ev.ndvi.measurement_date if (ev and hasattr(ev, "ndvi")) else "Filing Baseline")
-            sat_loss = getattr(ev.buffer, "baseline_loss_rate_pct", 0.4) if (ev and hasattr(ev, "buffer")) else 0.4
+            sat_loss = observed_project_loss_rate(ev)
+            bs = ev.baseline_sampling
+            period = bs.period if bs else ev.buffer.pre_period
+            n_sites = sum(s.role == "PROJECT_SITE" for s in bs.sites) if bs else 1
 
             claimed_val = f"{claimed_rate:.1f}{unit_str}"
             claim_param = "Reported Avoided Deforestation Baseline"
@@ -1399,21 +1447,25 @@ def render_plain_english_comparison(a: Dict[str, Any]) -> None:
             claim_badge = "Asserted Avoided Deforestation Baseline"
 
             if is_fraud:
-                actual_val = f"{sat_loss:.1f}{unit_str}"
+                actual_val = f"{sat_loss:.2f}%/yr"
                 actual_param = "Satellite-Derived Historical Baseline Loss"
                 actual_desc = (
-                    f"Independent {sensor_short} and Hansen Global Forest Change satellite telemetry indicates a "
-                    f"<b>satellite-derived historical baseline loss of only {actual_val}</b>. "
+                    f"Hansen Global Forest Change data across {n_sites} project sample area(s) shows "
+                    f"<b>historical forest loss of only {actual_val} during {period}</b>. "
                     f"The project's reported baseline loss rate is inflated above actual observed deforestation, "
                     f"generating unearned carbon offset credits against an exaggerated counterfactual."
                 )
                 variance_badge = f"+{claimed_rate - sat_loss:.1f}%/yr Baseline Inflation (+{disc:.0f}% Discrepancy)"
-                status_cls = "fail"
+                status_cls = "warn" if report.forensic_checks[0].status == "WARNING" else "fail"
             else:
-                actual_val = claimed_val
+                actual_val = f"{sat_loss:.2f}%/yr"
                 actual_param = "Satellite-Derived Historical Baseline Loss"
-                actual_desc = f"Independent {sensor_short} satellite telemetry confirms the reported avoided deforestation baseline aligns with historical satellite observation."
-                variance_badge = "Baseline Integrity Verified"
+                conservative = claimed_rate <= sat_loss - 0.5
+                actual_desc = (f"Hansen Global Forest Change loss across {n_sites} project sample area(s) during {period} "
+                               f"({sat_loss:.2f}%/yr) "
+                               + ("is higher than the filed rate, so the filed baseline is conservative for these areas."
+                                  if conservative else "is consistent with the reported avoided deforestation baseline."))
+                variance_badge = "Consistent with Satellite History (Sampled Areas)"
                 status_cls = "pass"
         else:
             c = next((c for c in x.sampling_claims if any(k in c.parameter.lower() for k in ("ndvi", "canopy", "biomass", "forest"))), None) or (x.sampling_claims[0] if x.sampling_claims else None)
@@ -1432,7 +1484,7 @@ def render_plain_english_comparison(a: Dict[str, Any]) -> None:
                 actual_param = "True Canopy Gain (Season-Matched)"
                 actual_desc = (
                     f"{sensor_short} satellite imagery shows the project's baseline was measured during the peak dry season "
-                    f"(NDVI {ev.ndvi.baseline_ndvi:.2f}), while the progress measurement was taken right after heavy monsoon rains. "
+                    f"(NDVI {ev.ndvi.baseline_ndvi:.2f}), while the progress measurement was taken right after heavy rainy-season rains. "
                     f"Comparing season-matched satellite images reveals that <b>{ev.ndvi.seasonal_artifact_pct:.0f}% of the claimed gain was temporary greening from rainfall</b>, "
                     f"rather than actual forest growth."
                 )
@@ -1446,24 +1498,25 @@ def render_plain_english_comparison(a: Dict[str, Any]) -> None:
                 status_cls = "pass"
 
     else:
-        c = next((claim for claim in x.sampling_claims if is_surface_effluent_concentration(claim)), None) or (x.sampling_claims[0] if x.sampling_claims else None)
-        claimed_num = c.claimed_project_value if c else 0.04
-        unit_str = c.unit if c else "mg/L"
-        limit_num = c.claimed_control_or_limit_value if (c and c.claimed_control_or_limit_value > 0) else 0.10
-        param_name = c.parameter.split(" at ")[0] if c else "River Effluent Cr-VI"
+        c = primary_eia_claim(x)
+        claimed_num = c.claimed_project_value if c else 0.0
+        unit_str = c.unit if c else ""
+        limit_num = c.claimed_control_or_limit_value if (c and c.claimed_control_or_limit_value > 0) else 0.0
+        limit_str = limit_text(c) if c else "not disclosed"
+        param_name = c.parameter.split(" at ")[0] if c else "Sampled parameter"
         sampling_dt = c.sampling_date if c else ev.rainfall.sampling_date
         gov_body = getattr(c, "governing_body", "") or getattr(x, "governing_body", "") or "Statutory Authority"
         is_conc = is_surface_effluent_concentration(c)
-        flood_dilution_trigger = is_conc and (ev.rainfall.sampling_day_mm > 25.0) and (ev.rainfall.sampling_percentile >= 90.0)
+        flood_dilution_trigger = flood_dilution_applies(c, ev.rainfall)
 
         claimed_val = f"{claimed_num:g} {unit_str}"
         claim_param = param_name
-        claim_badge = f"Asserted Compliant (Limit: {limit_num:g} {unit_str} under {gov_body} standards)"
+        claim_badge = f"Limit: {limit_str} under {gov_body} standards"
 
-        if is_compliant:
+        if not is_fraud:
             claim_desc = (
                 f"The applicant reported {param_name} of <b>{claimed_val}</b>, which is <b>within statutory permissible threshold</b> "
-                f"(limit: {limit_num:g} {unit_str} under {gov_body} standards) based on a sample collected on {sampling_dt}."
+                f"(limit: {limit_str} under {gov_body} standards) based on a sample collected on {sampling_dt}."
             )
             actual_val = claimed_val
             actual_param = f"{param_name} (Normal Flow)" if is_conc else f"{param_name} (Baseline Condition)"
@@ -1489,22 +1542,30 @@ def render_plain_english_comparison(a: Dict[str, Any]) -> None:
             actual_param = "Discharge under Normal Flow"
             actual_desc = (
                 f"Satellite climate data (CHIRPS) reveals this sample was collected during an extreme flood event "
-                f"(<b>{ev.rainfall.sampling_percentile:.0f}th-percentile monsoon deluge</b>, {ev.rainfall.sampling_day_mm:.1f} mm of rainfall). "
+                f"(<b>{ev.rainfall.sampling_percentile:.0f}th-percentile extreme rainfall</b>, {ev.rainfall.sampling_day_mm:.1f} mm of rainfall). "
                 f"The flood volume diluted effluent concentrations by approximately <b>{dilution:.1f}×</b>. "
                 f"Under normal dry-weather river flow, actual discharge reaches <b>{actual_val} — {ratio:.1f}× the permissible threshold under {gov_body} standards</b>."
             )
             variance_badge = f"{ratio:.1f}× Permissible Limit (Diluted by Flood)"
             status_cls = "fail"
+        elif claim_limit_breach(c) is None:
+            claim_desc = (f"The applicant reported {param_name} of <b>{claimed_val}</b> (sampled {sampling_dt}) "
+                          "without disclosing the statutory limit it is compared against.")
+            actual_val = f"{ev.rainfall.sampling_day_mm:.1f} mm rain"
+            actual_param = "Sampling-day rainfall (CHIRPS)"
+            actual_desc = "Weather at sampling was checked, but compliance cannot be confirmed without a disclosed limit."
+            variance_badge = "Limit not disclosed"
+            status_cls = "fail"
         else:
             claim_desc = (
-                f"The applicant reported {param_name} of <b>{claimed_val}</b>, exceeding "
-                f"the permissible threshold of {limit_num:g} {unit_str} under {gov_body} standards based on a sample collected on {sampling_dt}."
+                f"The applicant reported {param_name} of <b>{claimed_val}</b>, outside "
+                f"the permissible limit of {limit_str} under {gov_body} standards, based on a sample collected on {sampling_dt}."
             )
-            ratio = claimed_num / limit_num if limit_num > 0 else 1.0
             actual_val = claimed_val
-            actual_param = f"{param_name} (Observed)"
-            actual_desc = f"Measurements confirm {param_name} of {claimed_val}, which exceeds the permissible limit under {gov_body} standards."
-            variance_badge = f"{ratio:.1f}× Permissible Limit"
+            actual_param = f"{param_name} (Self-reported)"
+            actual_desc = (f"The filing itself reports {param_name} of {claimed_val}, outside the permissible limit of "
+                           f"{limit_str}. Sampling weather was normal ({ev.rainfall.sampling_day_mm:.1f} mm rain), so this is not a dilution artifact.")
+            variance_badge = f"Outside limit {limit_str}"
             status_cls = "fail"
 
     H(f"""
@@ -1535,10 +1596,14 @@ def render_plain_english_comparison(a: Dict[str, Any]) -> None:
 
 def render_audit_metrics_breakdown(a: Dict[str, Any]) -> None:
     entries = get_forensic_ledger_entries(a)
+    checks = a["report"].forensic_checks
     metric_cards_html = []
     for item in entries:
-        status_cls = "pass" if item["passed"] else "fail"
-        badge_text = "PASSED" if item["passed"] else "CRITICAL DISCREPANCY"
+        # Severity comes from the backend check the row is numbered after; WARNINGs must not render as critical.
+        idx = int(item["metric_label"].split(".", 1)[0]) - 1
+        backend = checks[idx].status if 0 <= idx < len(checks) else None
+        status_cls = "pass" if item["passed"] else ("warn" if backend == "WARNING" else "fail")
+        badge_text = {"pass": "PASSED", "warn": "NEEDS REVIEW", "fail": "CRITICAL DISCREPANCY"}[status_cls]
         metric_cards_html.append(f"""
         <div class="tt-metric-row {status_cls}">
           <div class="tt-metric-row-header">
@@ -1669,15 +1734,27 @@ def render_dispatch_section(a: Dict[str, Any]) -> None:
     """)
 
     is_out_of_scope = not getattr(report.extracted_data, "is_satellite_verifiable", True)
-    is_compliant = (report.verdict_banner == "✅ COMPLIANCE VERIFIED: STATUTORY LIMITS RESPECTED")
-    if is_out_of_scope:
+    is_compliant = report.verdict_banner in CLEARED_VERDICTS
+    if d.action_type == "PROVISIONAL_DATA_REVIEW":
+        btn_lbl = "Log Provisional Review Notice (Pub/Sub)"
+        toast_lbl = "Provisional review notice logged"
+        exp_lbl = "Provisional Result — Why No Action Was Issued"
+    elif is_out_of_scope:
         btn_lbl = "Archive Out-of-Scope Advisory (Pub/Sub)"
         toast_lbl = "Out-of-scope advisory archived"
         exp_lbl = "Regulatory Telemetry Directive & Coordinates"
+    elif is_compliant and report.extracted_data.filing_mode == "CARBON_OFFSET":
+        btn_lbl = "Publish Screening Result (Pub/Sub)"
+        toast_lbl = "Screening result published"
+        exp_lbl = "Verifier Advisory & Sampled Coordinates"
     elif is_compliant:
         btn_lbl = "Publish Regulatory Clearance (Pub/Sub)"
         toast_lbl = "Regulatory clearance published"
         exp_lbl = "Regulatory Directive & Baseline Coordinates"
+    elif d.action_type == "REGISTRY_ESCROW_HOLD_AND_RANGER_ALERT":
+        btn_lbl = "Send Registry Escrow Hold (Pub/Sub)"
+        toast_lbl = "Registry escrow hold published"
+        exp_lbl = "Registry Directive & Verification Coordinates"
     else:
         btn_lbl = "Send Field Inspection Alert (Pub/Sub)"
         toast_lbl = "Field alert published"

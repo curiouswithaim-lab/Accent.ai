@@ -6,15 +6,18 @@
   then acts as the reviewing biostatistician and rewrites the forensic findings,
   with guard-rails that keep geospatial dispatch coordinates authoritative.
 """
+import hashlib
 import io
 import json
 import os
 import re
+from pathlib import Path
 from typing import List, Optional, Tuple, Type, TypeVar
 
 from pydantic import BaseModel
 
 from schemas import (
+    AuditReview,
     ExtractedFilingData,
     ForensicCheckResult,
     FullAuditReport,
@@ -22,7 +25,9 @@ from schemas import (
     GroundDispatchAction,
     SamplingClaim,
     SatelliteEvidence,
+    TerrainPoint,
 )
+from services.earth_engine_verifier import redd_baseline_claim
 from services import PUBSUB_TOPIC_ID, force_offline, gcp_project, has_gcp_credentials, logger
 
 T = TypeVar("T", bound=BaseModel)
@@ -67,9 +72,18 @@ Extraction & Classification rules:
   centroid), CONTROL_SITE (reference / control / baseline plot), SENSOR_STATION (air monitor, water sampling
   point, outfall, substation), BUFFER_ZONE (village, receptor, leakage belt). If elevation is explicitly stated in meters,
   record in claimed_elevation_m; if omitted or not disclosed, record 0.0 or null.
+  For large multi-parcel projects (several districts, concessions or blocks), give one PROJECT_SITE per parcel, using
+  the centroid of the coordinates or bounding box the filing states for it. If the filing names a reference /
+  baseline region, give one CONTROL_SITE for it (its stated centroid, or the main town the filing names in it).
 - Every sampling claim: the reported project value, the control value OR the regulatory limit it is compared
   against, the unit (e.g. 'mg/L', 'ug/m3', 'pH', 'MWh', 'tCO2e', '%/yr', 'NDVI'), the ISO sampling date (YYYY-MM-DD), an exact page/table citation,
   and is_concentration_pollutant (True for chemical concentrations like mg/L or ppm, False for pH/temp/groundwater/energy/forestry).
+  When the permissible limit is a range (e.g. pH 6.5–8.5), put the upper bound in claimed_control_or_limit_value and
+  the lower bound in statutory_lower_limit; otherwise leave statutory_lower_limit null.
+  Report every measured parameter that the filing compares against a limit, including any that exceed it.
+  For a baseline deforestation rate, put the rate the filing applies to its baseline in claimed_control_or_limit_value,
+  set claimed_project_value to the project-scenario rate only if the filing states one (else 0.0), and set
+  reference_period to the historical years the rate was measured over (e.g. '2009-2011').
 - extracted_methodology_notes: verbatim quotes about weather during sampling, control-plot or sensor siting
   rationale, wind direction, grid connection, land classification ("barren", "scrub", "wasteland"), and leakage assumptions.
 Never invent coordinates. Be exhaustive and precise."""
@@ -77,8 +91,10 @@ Never invent coordinates. Be exhaustive and precise."""
 AUDIT_SYSTEM_PROMPT = """You are Accent.AI's lead environmental auditor and remote sensing specialist.
 Review the filing claims against independent Earth observation evidence (CHIRPS precipitation,
 ERA5 winds, SRTM topography, Sentinel-2 / Landsat 5/7 imagery, Hansen forest loss, NOAA GSOD stations).
-Produce the final FullAuditReport with exactly three checks in this order:
-"1. Temporal Confounding Check", "2. Spatial Control-Group Check", "3. Perimeter & Buffer Truth Check".
+You receive three deterministic check results. Their check_name and status values are FINAL — copy them exactly
+and never contradict them. Rewrite each check's pdf_claim_summary, satellite_truth_summary and
+statistical_discrepancy, keeping the order "1. Temporal Confounding Check", "2. Spatial Control-Group Check",
+"3. Perimeter & Buffer Truth Check", and rewrite the draft field directive.
 Every summary and statistical discrepancy must cite concrete measurements from the evidence.
 
 Forensic Audit Rules:
@@ -89,9 +105,7 @@ Forensic Audit Rules:
 3. Topography / Null Value: If baseline elevation is 0 or undisclosed (and satellite SRTM reads > 50 meters),
    do NOT calculate mathematical variance or declare them topographically equivalent; state:
    'Baseline Topography Not Disclosed — Relying on Independent Satellite DEM (SRTM: {satellite_elevation}m, {satellite_slope}° Slope)'.
-4. EIA Compliance: When declared measurements are within statutory limits (filed_value <= statutory_limit)
-   and climate data confirms normal sampling conditions without flood dilution (rain <= 25 mm or percentile < 90th),
-   the verdict is '✅ COMPLIANCE VERIFIED: STATUTORY LIMITS RESPECTED', integrity score 95-98/100, and Metric 01 status 'PASSED'.
+4. Do not invent measurements, coordinates or dates that are not in the claims or evidence.
 Write in clear, objective, and authoritative inspector language."""
 
 
@@ -99,10 +113,20 @@ Write in clear, objective, and authoritative inspector language."""
 # ---------------------------------------------------------------------------
 # google-genai client plumbing
 # ---------------------------------------------------------------------------
+_CLIENT_CACHE: List[Tuple[str, object]] = []
+
+
 def _clients() -> List[Tuple[str, object]]:
     """Ordered list of (label, genai.Client): Vertex AI first, then GEMINI_API_KEY fallback."""
     if force_offline():
         return []
+    if not _CLIENT_CACHE:
+        # Only successful inits are cached, so credentials mounted after the first call are still picked up.
+        _CLIENT_CACHE.extend(_build_clients())
+    return _CLIENT_CACHE
+
+
+def _build_clients() -> List[Tuple[str, object]]:
     out: List[Tuple[str, object]] = []
     try:
         from google import genai
@@ -165,9 +189,24 @@ def _generate_structured(contents, schema: Type[T], system_prompt: str, temperat
 # ---------------------------------------------------------------------------
 # 1. PDF extraction
 # ---------------------------------------------------------------------------
+def _extraction_cache_path(pdf_bytes: bytes, mode_hint: Optional[str]) -> Path:
+    from services.storage_service import LOCAL_DIR
+
+    key = hashlib.sha256(pdf_bytes + f"|{mode_hint}|{PRIMARY_MODEL}|{EXTRACTION_SYSTEM_PROMPT}".encode()).hexdigest()[:24]
+    return Path(LOCAL_DIR) / "extraction_cache" / f"{key}.json"
+
+
 def extract_filing(pdf_bytes: bytes, filename: str = "filing.pdf", mode_hint: Optional[str] = None) -> Tuple[ExtractedFilingData, str, List[str]]:
     """Returns (extracted_data, engine_label, warnings). Never raises."""
     warnings: List[str] = []
+    # Same PDF -> same extraction: Gemini output varies run to run even at temperature 0.
+    cache = _extraction_cache_path(pdf_bytes, mode_hint)
+    try:
+        if cache.exists():
+            hit = json.loads(cache.read_text())
+            return ExtractedFilingData.model_validate(hit["data"]), f"{hit['engine']} (cached)", hit.get("warnings", [])
+    except Exception as exc:
+        logger.warning("Extraction cache unreadable, re-extracting: %s", exc)
     if gemini_available():
         try:
             from google.genai import types
@@ -187,6 +226,12 @@ def extract_filing(pdf_bytes: bytes, filename: str = "filing.pdf", mode_hint: Op
             if not data.coordinates:
                 warnings.append("Gemini found no machine-readable coordinates in the filing.")
                 data = _ensure_coordinates(data, warnings)
+            try:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_text(json.dumps({"engine": engine, "warnings": warnings,
+                                             "data": json.loads(data.model_dump_json())}))
+            except Exception as exc:
+                logger.warning("Could not write extraction cache: %s", exc)
             return data, engine, warnings
         except Exception as exc:
             warnings.append(f"Gemini extraction failed ({exc.__class__.__name__}); used offline heuristic parser.")
@@ -200,8 +245,11 @@ _CARBON_KW = ("redd", "carbon credit", "tco2", "verra", "vcs", "afforestation", 
               "avoided deforestation", "leakage belt", "arr ")
 _EIA_KW = ("environmental impact", "eia", "effluent", "ambient air", "naaqs", "pollution control", "stack",
            "environmental clearance", "cpcb", "discharge")
-_RENEWABLE_GRID_KW = ("wind", "solar", "photovoltaic", "acm0002", "weihai", "grid-connected", "grid connected",
-                      "turbine", "shandong", "scada", "power-purchase")
+# Multi-word phrases only: bare "wind"/"turbine"/"stack" appear in nearly every EIA's air-quality section.
+_RENEWABLE_GRID_KW = ("wind farm", "wind power", "wind energy project", "wind turbine generator", "solar farm",
+                      "solar power", "solar pv", "photovoltaic", "acm0002", "grid-connected", "grid connected",
+                      "power purchase agreement", "scada")
+_FORESTRY_KW = ("redd", "afforestation", "reforestation", "deforestation", "canopy", "forest carbon")
 _OTHER_OOS_KW = ("cookstove", "cook stove", "hfc-23", "n2o", "landfill gas", "fugitive methane", "gas capture")
 _NOTE_KW = ("control", "reference plot", "upwind", "downwind", "rain", "monsoon", "barren", "scrub",
             "wasteland", "leakage", "representative", "comparable", "wind", "flood", "season", "scada", "metering", "grid")
@@ -252,10 +300,13 @@ def _heuristic_extract(pdf_bytes: bytes, filename: str, warnings: List[str], mod
     eia_score = sum(low.count(k) for k in _EIA_KW)
     renewable_score = sum(low.count(k) for k in _RENEWABLE_GRID_KW)
     other_oos_score = sum(low.count(k) for k in _OTHER_OOS_KW)
+    forestry_score = sum(low.count(k) for k in _FORESTRY_KW)
 
     mode = mode_hint or ("CARBON_OFFSET" if (carbon_score > eia_score or renewable_score > eia_score) else "EIA_CLEARANCE")
+    is_renewable = "acm0002" in low or (renewable_score >= 2 and renewable_score > eia_score
+                                         and renewable_score > forestry_score)
 
-    if renewable_score >= 1 or any(k in low for k in ("weihai", "acm0002", "wind farm", "solar farm")):
+    if is_renewable:
         subsector = "RENEWABLE_ENERGY_GRID"
         forestry_metric_type = "NOT_APPLICABLE"
         is_sat = False
@@ -263,7 +314,7 @@ def _heuristic_extract(pdf_bytes: bytes, filename: str, warnings: List[str], mod
             "Grid-connected displacement requires electrical SCADA telemetry and grid-dispatch "
             "metering receipts, which cannot be verified via optical earth observation satellites."
         )
-    elif other_oos_score >= 1:
+    elif other_oos_score >= 1 and other_oos_score > forestry_score:
         subsector = "OTHER_OUT_OF_SCOPE"
         forestry_metric_type = "NOT_APPLICABLE"
         is_sat = False
@@ -274,7 +325,7 @@ def _heuristic_extract(pdf_bytes: bytes, filename: str, warnings: List[str], mod
     elif mode == "CARBON_OFFSET":
         is_sat = True
         unsupported_reason = None
-        if any(k in low for k in ("arr", "afforestation", "reforestation", "canopy gain", "tree planting")):
+        if re.search(r"\barr\b|afforestation|reforestation|canopy gain|tree planting", low) and "redd" not in low:
             subsector = "FORESTRY_ARR"
             forestry_metric_type = "CANOPY_GAIN"
         else:
@@ -321,12 +372,12 @@ def _heuristic_extract(pdf_bytes: bytes, filename: str, warnings: List[str], mod
     if any(k in low for k in ("acm0002", "clean development mechanism", "cdm")):
         gov_body = "UNFCCC"
         gov_statute = "UNFCCC Clean Development Mechanism ACM0002"
-    elif "epa" in low:
-        gov_body = "US EPA"
-        gov_statute = "Clean Water Act"
     elif any(k in low for k in ("cpcb", "spcb", "sppb", "pollution control board", "moef")):
         gov_body = "State Pollution Control Board / CPCB"
         gov_statute = "Environment Protection Act"
+    elif re.search(r"\bu\.?s\.? ?epa\b|environmental protection agency", low):
+        gov_body = "US EPA"
+        gov_statute = "Clean Water Act"
     elif any(k in low for k in ("verra", "vcs", "redd")):
         gov_body = "Verra / VCS"
         gov_statute = "Verified Carbon Standard (VM0007)"
@@ -340,7 +391,8 @@ def _heuristic_extract(pdf_bytes: bytes, filename: str, warnings: List[str], mod
             param = m.group("param").strip()
             unit = (m.group("unit") or "").strip() or ("mg/L" if mode == "EIA_CLEARANCE" else "%")
             is_conc = (
-                not any(k in param.lower() for k in ("ph", "groundwater", "ground water", "temp", "turbidity", "water level", "depth", "mwh", "generation", "electricity"))
+                not _is_ph(param)
+                and not any(k in param.lower() for k in ("groundwater", "ground water", "temp", "turbidity", "water level", "depth", "mwh", "generation", "electricity"))
                 and unit.lower() not in ("ph", "mwh", "gwh", "kwh")
             )
             claims.append(SamplingClaim(
@@ -445,6 +497,15 @@ def compass(deg: float) -> str:
     return _COMPASS[int((deg % 360) / 22.5 + 0.5) % 16]
 
 
+FLOOD_MIN_MM = 25.0
+FLOOD_MIN_PCT = 90.0
+
+
+def _is_ph(text: str) -> bool:
+    # Word match: a bare substring test would also hit Phenol, Phosphate, Sulphide.
+    return bool(re.search(r"\bph\b", (text or "").lower()))
+
+
 def is_surface_effluent_concentration(c: Optional[SamplingClaim]) -> bool:
     if not c:
         return False
@@ -456,11 +517,57 @@ def is_surface_effluent_concentration(c: Optional[SamplingClaim]) -> bool:
     if any(k in param for k in ("groundwater", "ground water", "well", "borewell", "aquifer")):
         return False
     # pH, temperature, conductivity, turbidity, water level are not concentration pollutants
-    if "ph" in param or unit == "ph" or any(k in param for k in ("temp", "turbidity", "conductivity", "water level", "depth")):
+    if _is_ph(param) or unit == "ph" or any(k in param for k in ("temp", "turbidity", "conductivity", "water level", "depth")):
         return False
     is_surface = any(k in param for k in ("effluent", "river", "surface", "stream", "discharge", "outfall", "drain", "water"))
     is_conc = any(u in unit for u in ("mg/l", "ppm", "ug/m3", "ppb", "g/l", "mg/m3")) or any(k in param for k in ("cr", "metal", "bod", "cod", "tss", "tds", "phenol", "lead", "zinc"))
     return is_surface and (is_conc or getattr(c, "is_concentration_pollutant", True))
+
+
+def _is_soil(parameter: str) -> bool:
+    # EIA soil "normal ranges" are agronomic classifications, not statutory discharge or ambient limits.
+    return bool(re.search(r"\bsoil\b", parameter, re.I))
+
+
+def claim_limit_breach(c: Optional[SamplingClaim]) -> Optional[bool]:
+    """True if the filed value is outside its permissible limit/range, False if inside, None if no limit disclosed."""
+    if c is None or _is_soil(c.parameter):
+        return None
+    upper = c.claimed_control_or_limit_value if (c.claimed_control_or_limit_value or 0) > 0 else None
+    lower = c.statutory_lower_limit
+    if upper is None and lower is None:
+        return None
+    v = c.claimed_project_value
+    return bool((upper is not None and v > upper) or (lower is not None and v < lower))
+
+
+def limit_text(c: SamplingClaim) -> str:
+    upper = c.claimed_control_or_limit_value if (c.claimed_control_or_limit_value or 0) > 0 else None
+    if c.statutory_lower_limit is not None and upper is not None:
+        return f"{_fmt(c.statutory_lower_limit)}–{_fmt(upper)} {c.unit}"
+    if upper is not None:
+        return f"{_fmt(upper)} {c.unit}"
+    if c.statutory_lower_limit is not None:
+        return f"≥ {_fmt(c.statutory_lower_limit)} {c.unit}"
+    return "not disclosed"
+
+
+def eia_claims_in_breach(x: ExtractedFilingData) -> List[SamplingClaim]:
+    return [c for c in x.sampling_claims if claim_limit_breach(c)]
+
+
+def primary_eia_claim(x: ExtractedFilingData) -> Optional[SamplingClaim]:
+    """The claim the EIA verdict is about: a self-reported exceedance first, else the surface-effluent concentration."""
+    breaches = eia_claims_in_breach(x)
+    if breaches:
+        return breaches[0]
+    return (next((c for c in x.sampling_claims if is_surface_effluent_concentration(c)), None)
+            or (x.sampling_claims[0] if x.sampling_claims else None))
+
+
+def flood_dilution_applies(c: Optional[SamplingClaim], rainfall) -> bool:
+    return (is_surface_effluent_concentration(c) and rainfall.sampling_day_mm > FLOOD_MIN_MM
+            and rainfall.sampling_percentile >= FLOOD_MIN_PCT)
 
 
 def is_filing_pre_2015(x: Optional[ExtractedFilingData] = None, ev: Optional[SatelliteEvidence] = None) -> bool:
@@ -506,6 +613,11 @@ def get_sensor_label(x: Optional[ExtractedFilingData] = None, ev: Optional[Satel
     return "Sentinel-2" if short else "Sentinel-2 NDVI"
 
 
+def observed_project_loss_rate(ev: SatelliteEvidence) -> float:
+    """Multi-site project-area loss over the filing's reference period, else the single-site ring estimate."""
+    return ev.baseline_sampling.project_rate_pct if ev.baseline_sampling else ev.buffer.baseline_loss_rate_pct
+
+
 def is_redd_project(x: Optional[ExtractedFilingData] = None) -> bool:
     """Determine whether the filing represents a REDD+ avoided deforestation project."""
     if not x:
@@ -532,19 +644,25 @@ def _temporal_check(x: ExtractedFilingData, ev: SatelliteEvidence) -> Tuple[Fore
     r = ev.rainfall
     name = "1. Temporal Confounding Check"
     if x.filing_mode == "EIA_CLEARANCE":
-        c = next((claim for claim in x.sampling_claims if is_surface_effluent_concentration(claim)), None) or (x.sampling_claims[0] if x.sampling_claims else None)
+        breaches = eia_claims_in_breach(x)
+        conc = next((claim for claim in x.sampling_claims if is_surface_effluent_concentration(claim)), None)
+        flood_dilution_trigger = flood_dilution_applies(conc, r)
+        c = conc if flood_dilution_trigger else primary_eia_claim(x)
         pct = r.sampling_percentile
         day_mm = r.sampling_day_mm
         gov_body = (getattr(c, "governing_body", "") if c else "") or getattr(x, "governing_body", "") or "Statutory Authority"
         unit_str = c.unit if c else "mg/L"
         filed_val = c.claimed_project_value if c else 0.0
         limit_val = c.claimed_control_or_limit_value if (c and c.claimed_control_or_limit_value > 0) else 0.0
+        breach = claim_limit_breach(c)
 
         is_conc = is_surface_effluent_concentration(c)
-        flood_dilution_trigger = is_conc and (day_mm > 25.0) and (pct >= 90.0)
+        breach_txt = "; ".join(f"{b.parameter} {_fmt(b.claimed_project_value)} {b.unit} vs limit {limit_text(b)}"
+                               for b in breaches[:3])
 
-        claim_txt = (f"{c.parameter}: {_fmt(filed_val)} {unit_str} vs statutory limit {_fmt(limit_val)} "
-                     f"{unit_str} ({gov_body}), sampled {c.sampling_date} ({c.page_citation}). Reported as compliant."
+        claim_txt = (f"{c.parameter}: {_fmt(filed_val)} {unit_str} vs statutory limit {limit_text(c)} "
+                     f"({gov_body}), sampled {c.sampling_date} ({c.page_citation})."
+                     + (" Reported as compliant." if breach is False else "")
                      if c else "No dated effluent sampling claim disclosed.")
 
         if flood_dilution_trigger:
@@ -563,6 +681,9 @@ def _temporal_check(x: ExtractedFilingData, ev: SatelliteEvidence) -> Tuple[Fore
                 disc = (f"Sampled during heavy rainfall ({day_mm:.1f} mm, {pct:.0f}th percentile). "
                         f"Dilution-corrected concentration {_fmt(corrected)} {unit_str} remains within statutory permissible threshold.")
             penalty = max(0.0, pct - 95) * 1.5
+            if breaches:
+                status = "FAILED"
+                disc += f" Filing also self-reports values outside permissible limits: {breach_txt}."
         else:
             status = "PASSED"
             penalty = 0.0
@@ -575,10 +696,19 @@ def _temporal_check(x: ExtractedFilingData, ev: SatelliteEvidence) -> Tuple[Fore
             if r.bigquery_corroboration:
                 sat += f" Corroborated: {r.bigquery_corroboration}."
 
-            if not is_conc:
-                disc = f"Parameter '{c.parameter if c else 'Metric'}' is not a surface effluent concentration metric (logarithmic or groundwater scale). No flood dilution applies. Within statutory permissible threshold."
+            if breaches:
+                status = "FAILED"
+                penalty = min(8.0, 3.0 * len(breaches))
+                disc = (f"Filing self-reports {len(breaches)} parameter(s) outside permissible limits under {gov_body} "
+                        f"standards: {breach_txt}. Sampling weather was normal, so the exceedance is not a dilution artifact.")
+            elif breach is None:
+                status = "WARNING"
+                disc = (f"No statutory limit disclosed for '{c.parameter if c else 'the sampled parameter'}' — "
+                        "compliance cannot be confirmed from the filing.")
+            elif not is_conc:
+                disc = f"Parameter '{c.parameter if c else 'Metric'}' is not a surface effluent concentration metric (logarithmic or groundwater scale). No flood dilution applies. Within statutory permissible threshold ({limit_text(c)})."
             else:
-                disc = f"Sampling occurred under normal conditions ({day_mm:.1f} mm rain, {pct:.0f}th percentile). Within statutory permissible threshold."
+                disc = f"Sampling occurred under normal conditions ({day_mm:.1f} mm rain, {pct:.0f}th percentile). Within statutory permissible threshold ({limit_text(c)})."
         return ForensicCheckResult(check_name=name, status=status, pdf_claim_summary=claim_txt,
                                    satellite_truth_summary=sat, statistical_discrepancy=disc), penalty
     else:
@@ -588,25 +718,46 @@ def _temporal_check(x: ExtractedFilingData, ev: SatelliteEvidence) -> Tuple[Fore
         sensor_full = get_sensor_label(x, ev)
 
         if is_redd_project(x):
-            c_defor = _claim(x, ("deforestation", "loss rate", "baseline", "counterfactual", "redd"))
+            c_defor = redd_baseline_claim(x.sampling_claims)
             defor_val = c_defor.claimed_control_or_limit_value if (c_defor and c_defor.claimed_control_or_limit_value > 0) else (c_defor.claimed_project_value if c_defor else 3.9)
             unit_str = c_defor.unit if c_defor else "%/yr"
-            sat_loss = getattr(ev.buffer, "baseline_loss_rate_pct", 0.4) if hasattr(ev, "buffer") else 0.4
+            b, bs = ev.buffer, ev.baseline_sampling
+            sat_loss = observed_project_loss_rate(ev)
             sampling_dt = c_defor.sampling_date if c_defor else n.measurement_date
             citation = c_defor.page_citation if c_defor else "Filing Baseline"
+            period_txt = f" for {c_defor.reference_period}" if (c_defor and c_defor.reference_period) else ""
 
             claim_txt = (f"Reported Avoided Deforestation Baseline: {_fmt(defor_val)} {unit_str} "
-                         f"counterfactual loss rate, sampled {sampling_dt} ({citation}).")
-            sat = (f"{sensor_short}: Historical satellite-derived baseline loss of {sat_loss:.1f}{unit_str} "
-                   f"(surface reflectance re-analysis, baseline NDVI {n.baseline_ndvi:.2f} on {n.baseline_date}).")
-            if (defor_val - sat_loss) >= 1.5 or art >= 50:
-                status = "FAILED" if (defor_val - sat_loss) >= 2.0 or art >= 50 else "WARNING"
+                         f"counterfactual loss rate{period_txt}, filed {sampling_dt} ({citation}).")
+            if bs:
+                n_sites = sum(s.role == "PROJECT_SITE" for s in bs.sites)
+                sat = (f"Hansen Global Forest Change: observed forest loss of {sat_loss:.2f}%/yr across {n_sites} project "
+                       f"sample area(s) ({bs.sites[0].radius_km:.0f} km radius each, canopy ≥{bs.canopy_threshold_pct}%, "
+                       f"mean tree cover {bs.mean_tree_cover_pct:.0f}%) during {bs.period}.")
+            else:
+                sat = (f"Hansen Global Forest Change: observed forest loss of {sat_loss:.2f}%/yr across the project and "
+                       f"5 km buffer during {b.pre_period} (pre-project reference period).")
+            # REDD+ credits avoided loss, not canopy gain, so the NDVI seasonal artifact does not apply here.
+            gap = defor_val - sat_loss
+            ratio = defor_val / max(sat_loss, 0.05)
+            if "%" not in unit_str:
+                status = "WARNING"
+                disc = (f"Filed baseline is expressed in '{unit_str}', not a percentage loss rate, so it cannot be compared "
+                        f"directly with the satellite-observed {sat_loss:.2f}%/yr — verifier must convert using the filed forest area.")
+                penalty = 0.0
+            elif gap >= 2.0 or (gap >= 1.0 and ratio >= 2.0) or (gap >= 0.5 and ratio >= 1.5):
+                status = "FAILED" if (gap >= 2.0 or (gap >= 1.0 and ratio >= 2.0)) else "WARNING"
                 disc = (f"Reported Avoided Deforestation Baseline ({_fmt(defor_val)}{unit_str}) inflated against satellite-derived "
-                        f"historical baseline loss ({sat_loss:.1f}{unit_str}) — +{defor_val - sat_loss:.1f}%/yr baseline discrepancy.")
-                penalty = max(0.0, (defor_val - sat_loss) * 10.0)
+                        f"historical baseline loss ({sat_loss:.2f}%/yr) — +{gap:.1f}%/yr ({ratio:.1f}×) baseline discrepancy.")
+                penalty = max(0.0, gap * 10.0)
+            elif gap <= -0.5:
+                status = "PASSED"
+                disc = (f"Reported baseline ({_fmt(defor_val)}{unit_str}) is below the satellite-observed historical loss "
+                        f"({sat_loss:.2f}%/yr) — conservative; it does not inflate credited avoided emissions.")
+                penalty = 0.0
             else:
                 status = "PASSED"
-                disc = f"Reported Avoided Deforestation Baseline ({_fmt(defor_val)}{unit_str}) corroborated by historical satellite loss ({sat_loss:.1f}{unit_str})."
+                disc = f"Reported Avoided Deforestation Baseline ({_fmt(defor_val)}{unit_str}) corroborated by historical satellite loss ({sat_loss:.2f}%/yr)."
                 penalty = 0.0
         else:
             status = "FAILED" if (art >= 50 and n.claimed_gain_pct >= 8) else "WARNING" if art >= 25 else "PASSED"
@@ -650,44 +801,100 @@ def _spatial_check(x: ExtractedFilingData, ev: SatelliteEvidence) -> Tuple[Foren
                 if w.sensor_is_upwind else
                 f"Sensor offset {w.angular_offset_deg:.0f}° from upwind axis; partial plume capture likely.")
         penalty = max(0.0, 45 - w.angular_offset_deg) * 0.15 if w.sensor_is_upwind else 0.0
+        return ForensicCheckResult(check_name=name, status=status, pdf_claim_summary=claim_txt,
+                                   satellite_truth_summary=sat, statistical_discrepancy=disc), penalty
+    return _with_loss_pressure(*_terrain_comparability(x, ev), ev)
+
+
+_SEVERITY = {"PASSED": 0, "WARNING": 1, "FAILED": 2}
+
+
+def _with_loss_pressure(res: ForensicCheckResult, penalty: float, ev: SatelliteEvidence) -> Tuple[ForensicCheckResult, float]:
+    """A reference area is only a fair counterfactual if its historical deforestation matches the project area's."""
+    bs = ev.baseline_sampling
+    if not bs or bs.reference_rate_pct is None:
+        return res, penalty
+    pr, rr = bs.project_rate_pct, bs.reference_rate_pct
+    ratio = rr / max(pr, 0.05)
+    status = ("FAILED" if ratio >= 2.0 and rr - pr >= 0.5 else
+              "WARNING" if ratio >= 1.5 and rr - pr >= 0.3 else "PASSED")
+    sat = (f"{res.satellite_truth_summary} Hansen GFC {bs.period}: reference area lost {rr:.2f}%/yr vs "
+           f"{pr:.2f}%/yr across the project sites (canopy ≥{bs.canopy_threshold_pct}%).")
+    if status == "PASSED":
+        disc = f"{res.statistical_discrepancy} Deforestation pressure is comparable ({rr:.2f} vs {pr:.2f}%/yr)."
     else:
-        proj = next((t for t in ev.terrain if t.role == "PROJECT_SITE"), ev.terrain[0] if ev.terrain else None)
-        ctrl = next((t for t in ev.terrain if t.role == "CONTROL_SITE"), None)
-        if ctrl is None or proj is None:
-            return ForensicCheckResult(check_name=name, status="WARNING",
-                                       pdf_claim_summary="No reference/control plot coordinates disclosed.",
-                                       satellite_truth_summary="SRTM comparability test not possible.",
-                                       statistical_discrepancy="Counterfactual baseline is unverifiable."), 0.0
+        disc = (f"Reference area deforested {ratio:.1f}× faster than the project area ({rr:.2f} vs {pr:.2f}%/yr, "
+                f"{bs.period}) — a baseline drawn from it overstates the threat to the project forest. "
+                f"{res.statistical_discrepancy}")
+    worst = max(res.status, status, key=_SEVERITY.get)
+    extra = max(0.0, (ratio - 2.0) * 3.0) if status == "FAILED" else 0.0
+    return res.model_copy(update={"status": worst, "satellite_truth_summary": sat,
+                                  "statistical_discrepancy": disc}), penalty + extra
 
-        ctrl_elev = ctrl.claimed_elevation_m
-        if (ctrl_elev is None or ctrl_elev == 0.0) and ctrl.srtm_elevation_m > 50.0:
-            finding_text = f"Baseline Topography Not Disclosed — Relying on Independent Satellite DEM (SRTM: {ctrl.srtm_elevation_m:.0f}m, {ctrl.slope_deg:.1f}° Slope)"
-            return ForensicCheckResult(
-                check_name=name,
-                status="PASSED",
-                pdf_claim_summary="Baseline elevation omitted in filing (0 m or undisclosed).",
-                satellite_truth_summary=f"SRTM DEM: control slope {ctrl.slope_deg:.1f}° at {ctrl.srtm_elevation_m:.0f} m elevation.",
-                statistical_discrepancy=finding_text,
-            ), 0.0
 
-        ds, de = ctrl.slope_deg - proj.slope_deg, ctrl.srtm_elevation_m - (ctrl_elev or 0.0)
-        road = ctrl.distance_to_road_km
-        near_road = road is not None and road < 0.5
-        status = "FAILED" if (abs(ds) >= 15 or near_road) else "WARNING" if (abs(ds) >= 7 or abs(de) > 150) else "PASSED"
-        c = _claim(x, ("deforestation", "baseline", "control", "loss rate"))
-        ctrl_claimed_str = f"{ctrl.claimed_elevation_m:.0f} m" if (ctrl.claimed_elevation_m is not None and ctrl.claimed_elevation_m > 0) else "undisclosed"
-        claim_txt = (f"Reference control plot '{ctrl.label}' declared topographically comparable "
-                     f"(claimed elevation {ctrl_claimed_str})."
-                     + (f" {c.parameter}: {_fmt(c.claimed_control_or_limit_value)} {c.unit} in control vs "
-                        f"{_fmt(c.claimed_project_value)} {c.unit} in project ({c.page_citation})." if c else ""))
-        sat = (f"SRTM 30 m: control slope {ctrl.slope_deg:.1f}° at {ctrl.srtm_elevation_m:.0f} m vs project "
-               f"{proj.slope_deg:.1f}° at {proj.srtm_elevation_m:.0f} m."
-               + (f" Control plot edge is {road * 1000:.0f} m from an active logging highway." if road is not None else ""))
-        disc = (f"Control is {ds:+.0f}° steeper and {de:+.0f} m higher"
-                + (" beside a haul road" if near_road else "")
-                + f" (claimed elevation off by {ctrl.srtm_elevation_m - (ctrl.claimed_elevation_m or 0.0):+.0f} m) — a non-comparable, "
-                  "high-risk counterfactual that inflates baseline deforestation and credited avoided emissions.")
-        penalty = max(0.0, abs(ds) - 15) * 0.5
+def project_terrain(ev: SatelliteEvidence) -> Optional[TerrainPoint]:
+    sites = [t for t in ev.terrain if t.role == "PROJECT_SITE"]
+    if len(sites) <= 1:
+        return sites[0] if sites else (ev.terrain[0] if ev.terrain else None)
+    return sites[0].model_copy(update={
+        "label": f"{len(sites)} project sites (mean)",
+        "srtm_elevation_m": round(sum(t.srtm_elevation_m for t in sites) / len(sites), 1),
+        "slope_deg": round(sum(t.slope_deg for t in sites) / len(sites), 1),
+    })
+
+
+def _terrain_comparability(x: ExtractedFilingData, ev: SatelliteEvidence) -> Tuple[ForensicCheckResult, float]:
+    name = "2. Spatial Control-Group Check"
+    proj = project_terrain(ev)
+    ctrl = next((t for t in ev.terrain if t.role == "CONTROL_SITE"), None)
+    if ctrl is None or proj is None:
+        return ForensicCheckResult(check_name=name, status="WARNING",
+                                   pdf_claim_summary="No reference/control plot coordinates disclosed.",
+                                   satellite_truth_summary="SRTM comparability test not possible.",
+                                   statistical_discrepancy="Counterfactual baseline is unverifiable."), 0.0
+
+    ctrl_elev = ctrl.claimed_elevation_m
+    ds = ctrl.slope_deg - proj.slope_deg
+    road = ctrl.distance_to_road_km
+    near_road = road is not None and road < 0.5
+    if (ctrl_elev is None or ctrl_elev == 0.0) and ctrl.srtm_elevation_m > 50.0:
+        # No claimed elevation to check, but control-vs-project comparability is still measurable from SRTM.
+        dsat = ctrl.srtm_elevation_m - proj.srtm_elevation_m
+        status = "FAILED" if (abs(ds) >= 15 or near_road) else "WARNING" if (abs(ds) >= 7 or abs(dsat) > 150) else "PASSED"
+        finding_text = f"Baseline Topography Not Disclosed — Relying on Independent Satellite DEM (SRTM: {ctrl.srtm_elevation_m:.0f}m, {ctrl.slope_deg:.1f}° Slope)"
+        finding_text += (f". Control sits {dsat:+.0f} m / {ds:+.1f}° relative to project site '{proj.label}' — "
+                         "not topographically comparable, so the counterfactual baseline may not represent the project area."
+                         if status != "PASSED" else
+                         f". Control and project terrain are comparable ({dsat:+.0f} m, {ds:+.1f}°).")
+        return ForensicCheckResult(
+            check_name=name,
+            status=status,
+            pdf_claim_summary=f"Reference area '{ctrl.label}' declared; baseline elevation omitted in filing.",
+            satellite_truth_summary=(f"SRTM DEM: control slope {ctrl.slope_deg:.1f}° at {ctrl.srtm_elevation_m:.0f} m vs project "
+                                     f"{proj.slope_deg:.1f}° at {proj.srtm_elevation_m:.0f} m."),
+            statistical_discrepancy=finding_text,
+        ), max(0.0, abs(ds) - 15) * 0.5
+
+    de = ctrl.srtm_elevation_m - (ctrl_elev or 0.0)
+    dproj = ctrl.srtm_elevation_m - proj.srtm_elevation_m
+    status = ("FAILED" if (abs(ds) >= 15 or near_road) else
+              "WARNING" if (abs(ds) >= 7 or abs(de) > 150 or abs(dproj) > 150) else "PASSED")
+    c = _claim(x, ("deforestation", "baseline", "control", "loss rate"))
+    ctrl_claimed_str = f"{ctrl.claimed_elevation_m:.0f} m" if (ctrl.claimed_elevation_m is not None and ctrl.claimed_elevation_m > 0) else "undisclosed"
+    claim_txt = (f"Reference control plot '{ctrl.label}' declared topographically comparable "
+                 f"(claimed elevation {ctrl_claimed_str})."
+                 + (f" {c.parameter}: {_fmt(c.claimed_control_or_limit_value)} {c.unit} in control vs "
+                    f"{_fmt(c.claimed_project_value)} {c.unit} in project ({c.page_citation})." if c else ""))
+    sat = (f"SRTM 30 m: control slope {ctrl.slope_deg:.1f}° at {ctrl.srtm_elevation_m:.0f} m vs project "
+           f"{proj.slope_deg:.1f}° at {proj.srtm_elevation_m:.0f} m."
+           + (f" Control plot edge is {road * 1000:.0f} m from an active logging highway." if road is not None else ""))
+    disc = (f"Control is {ds:+.0f}° steeper and {dproj:+.0f} m higher than the project"
+            + (" beside a haul road" if near_road else "")
+            + f" (claimed elevation off by {de:+.0f} m) — a non-comparable, "
+              "high-risk counterfactual that inflates baseline deforestation and credited avoided emissions."
+            if status != "PASSED" else
+            f"Control plot terrain comparable to the project ({ds:+.1f}° slope, {dproj:+.0f} m; claimed elevation within {abs(de):.0f} m).")
+    penalty = max(0.0, abs(ds) - 15) * 0.5
     return ForensicCheckResult(check_name=name, status=status, pdf_claim_summary=claim_txt,
                                satellite_truth_summary=sat, statistical_discrepancy=disc), penalty
 
@@ -735,18 +942,21 @@ def _buffer_check(x: ExtractedFilingData, ev: SatelliteEvidence) -> Tuple[Forens
 
 def _score_and_verdict(checks: List[ForensicCheckResult], extra_penalty: float, x: Optional[ExtractedFilingData] = None) -> Tuple[int, str]:
     if x and x.filing_mode == "EIA_CLEARANCE":
-        c = next((claim for claim in x.sampling_claims if is_surface_effluent_concentration(claim)), None) or (x.sampling_claims[0] if x.sampling_claims else None)
-        if c:
-            filed_val = c.claimed_project_value
-            limit_val = c.claimed_control_or_limit_value
-            if (limit_val <= 0 or filed_val <= limit_val) and checks[0].status == "PASSED":
-                score = 98 if all(chk.status == "PASSED" for chk in checks) else 96
-                return score, "✅ COMPLIANCE VERIFIED: STATUTORY LIMITS RESPECTED"
+        c = primary_eia_claim(x)
+        compliant = (claim_limit_breach(c) is False and not eia_claims_in_breach(x)
+                     and checks[0].status == "PASSED" and not any(chk.status == "FAILED" for chk in checks))
+        if compliant:
+            score = 98 if all(chk.status == "PASSED" for chk in checks) else 96
+            return score, "✅ COMPLIANCE VERIFIED: STATUTORY LIMITS RESPECTED"
     score = 100.0
     for c in checks:
         score -= {"FAILED": 28, "WARNING": 12, "PASSED": 0}[c.status]
     score = int(round(min(100, max(3, score - min(extra_penalty, 8.0)))))
-    return score, _verdict_for(score, checks)
+    verdict = _verdict_for(score, checks)
+    if x and x.filing_mode == "EIA_CLEARANCE" and verdict == "VERIFIED BASELINE INTEGRITY":
+        # An EIA only clears through the statutory-compliance gate above; unconfirmable limits are not a pass.
+        verdict = "MODERATE METHODOLOGICAL BIAS"
+    return score, verdict
 
 
 def _verdict_for(score: int, checks: List[ForensicCheckResult]) -> str:
@@ -762,7 +972,19 @@ def _dispatch(x: ExtractedFilingData, ev: SatelliteEvidence, verdict: str, check
     topic = f"projects/{gcp_project() or 'your-gcp-project-id'}/topics/{PUBSUB_TOPIC_ID}"
     lat, lon = ev.recommended_dispatch_lat, ev.recommended_dispatch_lon
     gov_body = getattr(x, "governing_body", "") or "Statutory Authority"
-    if verdict in ("✅ COMPLIANCE VERIFIED: STATUTORY LIMITS RESPECTED", "VERIFIED BASELINE INTEGRITY"):
+    if verdict == "VERIFIED BASELINE INTEGRITY":
+        flagged = [c.check_name.split(". ", 1)[-1] for c in checks if c.status != "PASSED"]
+        return GroundDispatchAction(
+            pubsub_topic=topic, action_type="COMPLIANCE_CLEARED", priority="ROUTINE",
+            target_recipient=f"{gov_body} verification desk (advisory — registry decision remains with the verifier)",
+            recommended_coordinates_lat=lat, recommended_coordinates_lon=lon,
+            recommended_time_window="Next scheduled monitoring / verification event",
+            instruction_directive=(
+                "No material discrepancy found between the filed baseline and satellite history at the sampled sites. "
+                "This is an independent screening result, not registry approval."
+                + (f" Flagged for verifier review: {', '.join(flagged)}." if flagged else "")),
+        )
+    if verdict == "✅ COMPLIANCE VERIFIED: STATUTORY LIMITS RESPECTED":
         return GroundDispatchAction(
             pubsub_topic=topic, action_type="COMPLIANCE_CLEARED", priority="ROUTINE",
             target_recipient=f"{gov_body} Compliance Archive & Regulatory Registry",
@@ -777,21 +999,31 @@ def _dispatch(x: ExtractedFilingData, ev: SatelliteEvidence, verdict: str, check
         ctrl = next((t for t in ev.terrain if t.role == "CONTROL_SITE"), None)
         proj = next((t for t in ev.terrain if t.role == "PROJECT_SITE"), None)
         slope_cap = (proj.slope_deg + 5) if proj else 10
+        bs = ev.baseline_sampling
+        steps = [f"Freeze issuance of pending credits for '{x.project_title}' pending re-verification "
+                 f"[failed: {', '.join(failed) or 'methodology review'}]."]
+        if checks[0].status != "PASSED" and is_redd_project(x):
+            steps.append(f"Require the proponent's own {bs.period if bs else 'reference-period'} land-cover classification "
+                         "and change maps for independent re-analysis against Hansen GFC and Landsat.")
+        if checks[1].status != "PASSED":
+            steps.append("Re-select the reference area so its historical deforestation pressure and terrain match the "
+                         f"project area (slope ≤ {slope_cap:.0f}°, >2 km from roads)"
+                         + (f", replacing '{ctrl.label}'" if ctrl else "") + ".")
+        if checks[2].status != "PASSED":
+            steps.append(f"Ranger team to {lat:.4f}, {lon:.4f} ({b.hotspot_distance_outside_km:.1f} km outside perimeter, "
+                         f"{b.peak_change_pct:+.0f}% canopy loss): geotag fresh stumps, skid trails and log decks.")
+        if not is_redd_project(x) and checks[0].status != "PASSED":
+            steps.append("Re-measure canopy NDVI in the same calendar month as the baseline.")
         return GroundDispatchAction(
             pubsub_topic=topic, action_type="REGISTRY_ESCROW_HOLD_AND_RANGER_ALERT",
             priority="CRITICAL" if critical else "HIGH",
-            target_recipient=f"Carbon Registry Integrity Desk (issuance escrow) + {x.region_name} forest ranger unit",
+            target_recipient=f"Carbon Registry Integrity Desk (issuance escrow)"
+                             + (f" + {x.region_name} forest ranger unit" if checks[2].status != "PASSED" else ""),
             recommended_coordinates_lat=lat, recommended_coordinates_lon=lon,
-            recommended_time_window="Escrow hold effective on publish; ranger patrol within 72 h; season-matched NDVI "
-                                    f"re-measurement in {ev.rainfall.dry_window_suggestion.split(' (')[0]}",
-            instruction_directive=(
-                f"(1) Freeze issuance of pending credits for '{x.project_title}' pending re-verification "
-                f"[failed: {', '.join(failed) or 'methodology review'}]. "
-                f"(2) Ranger team to {lat:.4f}, {lon:.4f} ({b.hotspot_distance_outside_km:.1f} km outside perimeter, "
-                f"{b.peak_change_pct:+.0f}% canopy loss): geotag fresh stumps, skid trails and log decks. "
-                f"(3) Re-establish the control plot on matched terrain (slope ≤ {slope_cap:.0f}°, >2 km from roads)"
-                + (f" replacing '{ctrl.label}'" if ctrl else "") + ". "
-                "(4) Re-measure canopy NDVI in the same calendar month as the baseline."),
+            recommended_time_window="Escrow hold effective on publish"
+                                    + ("; ranger patrol within 72 h" if checks[2].status != "PASSED" else "")
+                                    + "; proponent response within 30 days",
+            instruction_directive=" ".join(f"({i}) {s}" for i, s in enumerate(steps, 1)),
         )
     w = ev.wind
     water = next((p for p in x.coordinates if p.role == "SENSOR_STATION" and
@@ -866,8 +1098,33 @@ def build_deterministic_report(x: ExtractedFilingData, ev: SatelliteEvidence) ->
     results = [_temporal_check(x, ev), _spatial_check(x, ev), _buffer_check(x, ev)]
     checks = [r[0] for r in results]
     score, verdict = _score_and_verdict(checks, sum(r[1] for r in results), x=x)
+    provisional = [p.layer for p in ev.provenance
+                   if p.mode == "DETERMINISTIC_FALLBACK" and p.layer in _VERDICT_LAYERS[x.filing_mode]]
+    dispatch = _provisional_dispatch(x, ev, provisional) if provisional else _dispatch(x, ev, verdict, checks)
     return FullAuditReport(extracted_data=x, integrity_score=score, verdict_banner=verdict,
-                           forensic_checks=checks, dispatch_action=_dispatch(x, ev, verdict, checks))
+                           forensic_checks=checks, dispatch_action=dispatch, provisional_layers=provisional)
+
+
+# Evidence layers that feed the three checks for each filing mode (others are context only).
+_VERDICT_LAYERS = {
+    "EIA_CLEARANCE": {"Precipitation", "Wind vectors", "Buffer-ring loss"},
+    "CARBON_OFFSET": {"Vegetation NDVI", "Elevation & slope", "Buffer-ring loss", "Multi-site baseline loss"},
+}
+
+
+def _provisional_dispatch(x: ExtractedFilingData, ev: SatelliteEvidence, layers: List[str]) -> GroundDispatchAction:
+    """Synthetic fallback telemetry must never drive a clearance, credit hold or inspection."""
+    return GroundDispatchAction(
+        pubsub_topic=f"projects/{gcp_project() or 'your-gcp-project-id'}/topics/{PUBSUB_TOPIC_ID}",
+        action_type="PROVISIONAL_DATA_REVIEW", priority="ROUTINE",
+        target_recipient="Accent.AI audit desk (internal review — no external action)",
+        recommended_coordinates_lat=ev.recommended_dispatch_lat, recommended_coordinates_lon=ev.recommended_dispatch_lon,
+        recommended_time_window="Re-run once live Earth Engine layers are available",
+        instruction_directive=(
+            f"NO ENFORCEMENT ACTION ISSUED for '{x.project_title}'. These evidence layers used synthetic fallback "
+            f"telemetry because live satellite queries were unavailable or failed: {', '.join(layers)}. Findings are "
+            "provisional and must not be used for clearances, credit holds or inspections until re-run on live data."),
+    )
 
 
 def _evidence_digest(ev: SatelliteEvidence) -> dict:
@@ -894,30 +1151,24 @@ def build_audit_report(x: ExtractedFilingData, ev: SatelliteEvidence, use_gemini
         prompt = (
             "EXTRACTED FILING CLAIMS:\n" + x.model_dump_json(indent=1)
             + "\n\nINDEPENDENT SATELLITE / REANALYSIS EVIDENCE:\n" + json.dumps(_evidence_digest(ev), indent=1)
-            + "\n\nPRELIMINARY DETERMINISTIC AUDIT:\n" + base.model_dump_json(indent=1)
-            + "\n\nReturn the final FullAuditReport."
+            + "\n\nDETERMINISTIC CHECK RESULTS (check_name and status are final):\n"
+            + json.dumps([c.model_dump() for c in base.forensic_checks], indent=1)
+            + f"\n\nVERDICT: {base.verdict_banner} (integrity score {base.integrity_score}/100)"
+            + f"\nDRAFT FIELD DIRECTIVE: {base.dispatch_action.instruction_directive}"
         )
-        report, engine = _generate_structured(prompt, FullAuditReport, AUDIT_SYSTEM_PROMPT, 0.2)
-        if len(report.forensic_checks) != 3:
+        # Small output schema: Gemini rewrites prose only; statuses, score, verdict and dispatch routing stay deterministic.
+        review, engine = _generate_structured(prompt, AuditReview, AUDIT_SYSTEM_PROMPT, 0.2)
+        if len(review.forensic_checks) != 3:
             raise ValueError("Gemini returned wrong number of checks")
-        if base.verdict_banner == "✅ COMPLIANCE VERIFIED: STATUTORY LIMITS RESPECTED":
-            verdict = "✅ COMPLIANCE VERIFIED: STATUTORY LIMITS RESPECTED"
-            score = max(report.integrity_score, 96)
-        else:
-            score = int(min(100, max(0, report.integrity_score)))
-            verdict = _verdict_for(score, report.forensic_checks)
-        # Guard-rails: geospatial dispatch geometry + routing stays deterministic & authoritative.
-        dispatch = _dispatch(x, ev, verdict, report.forensic_checks)
-        if verdict == "✅ COMPLIANCE VERIFIED: STATUTORY LIMITS RESPECTED":
-            dispatch.instruction_directive = "⚡ AUTOMATED REGULATORY CLEARANCE ISSUED: Filing meets statutory baseline standards."
-        else:
-            dispatch.instruction_directive = report.dispatch_action.instruction_directive or dispatch.instruction_directive
-        # Guard-rail: if baseline topography was undisclosed, preserve DEM finding and bypass
-        report_checks = list(report.forensic_checks)
-        if base.forensic_checks and len(base.forensic_checks) >= 2 and "Baseline Topography Not Disclosed" in base.forensic_checks[1].statistical_discrepancy:
-            report_checks[1] = base.forensic_checks[1]
-        report = report.model_copy(update=dict(extracted_data=x, integrity_score=score, verdict_banner=verdict,
-                                                forensic_checks=report_checks, dispatch_action=dispatch))
+        checks = [rc.model_copy(update={"check_name": bc.check_name, "status": bc.status})
+                  for rc, bc in zip(review.forensic_checks, base.forensic_checks)]
+        if "Baseline Topography Not Disclosed" in base.forensic_checks[1].statistical_discrepancy:
+            checks[1] = base.forensic_checks[1]
+        dispatch = base.dispatch_action.model_copy()
+        if dispatch.action_type in ("COUNTER_SAMPLING_DISPATCH", "REGISTRY_ESCROW_HOLD_AND_RANGER_ALERT") \
+                and review.instruction_directive.strip():
+            dispatch.instruction_directive = review.instruction_directive
+        report = base.model_copy(update=dict(forensic_checks=checks, dispatch_action=dispatch))
         return report, f"Gemini audit review ({engine})"
     except Exception as exc:
         logger.warning("Gemini audit reasoning failed, deterministic report used: %s", exc)

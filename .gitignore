@@ -66,4 +66,5 @@ service-account*.json
 # Benchmark Cases & Sample PDFs (kept local on app, not tracked in public git)
 demo_data/
 *.pdf
+PROJECT_OVERVIEW.md
 
