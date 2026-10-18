@@ -1,6 +1,6 @@
 """Shared GCP environment helpers for Accent.AI service modules.
 
-Accent.AI: Audit of Carbon Credits and ENvironmental impacT on land using AI.
+Accent.AI: Audit of Carbon Credits and ENvironmenTal clearances using AI.
 Every service follows the same contract: attempt the live Google Cloud SDK call,
 and on *any* failure (missing credentials, missing API enablement, network
 errors, quota) fall back to deterministic telemetry so a live demo never crashes.

@@ -38,7 +38,7 @@ FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash")
 EXTRACTION_SYSTEM_PROMPT = """You are Accent.AI's forensic document analyst. You read Environmental Impact
 Assessments (EIAs) and Voluntary Carbon Market Project Design Documents (PDDs) the way a clinical-trial
 auditor reads a study protocol: you hunt for the baseline, the control group, and the sampling conditions.
-Accent.AI stands for Audit of Carbon Credits and ENvironmental impacT on land using AI.
+Accent.AI stands for Audit of Carbon Credits and ENvironmenTal clearances using AI.
 
 Extraction & Classification rules:
 - filing_mode: Autonomously classify the document. Set filing_mode = CARBON_OFFSET for REDD+, ARR,
@@ -1015,7 +1015,8 @@ def _dispatch(x: ExtractedFilingData, ev: SatelliteEvidence, verdict: str, check
         if not is_redd_project(x) and checks[0].status != "PASSED":
             steps.append("Re-measure canopy NDVI in the same calendar month as the baseline.")
         return GroundDispatchAction(
-            pubsub_topic=topic, action_type="REGISTRY_ESCROW_HOLD_AND_RANGER_ALERT",
+            pubsub_topic=topic,
+            action_type="REGISTRY_ESCROW_HOLD" + ("_AND_RANGER_ALERT" if checks[2].status != "PASSED" else ""),
             priority="CRITICAL" if critical else "HIGH",
             target_recipient=f"Carbon Registry Integrity Desk (issuance escrow)"
                              + (f" + {x.region_name} forest ranger unit" if checks[2].status != "PASSED" else ""),
@@ -1165,7 +1166,7 @@ def build_audit_report(x: ExtractedFilingData, ev: SatelliteEvidence, use_gemini
         if "Baseline Topography Not Disclosed" in base.forensic_checks[1].statistical_discrepancy:
             checks[1] = base.forensic_checks[1]
         dispatch = base.dispatch_action.model_copy()
-        if dispatch.action_type in ("COUNTER_SAMPLING_DISPATCH", "REGISTRY_ESCROW_HOLD_AND_RANGER_ALERT") \
+        if (dispatch.action_type == "COUNTER_SAMPLING_DISPATCH" or dispatch.action_type.startswith("REGISTRY_ESCROW_HOLD")) \
                 and review.instruction_directive.strip():
             dispatch.instruction_directive = review.instruction_directive
         report = base.model_copy(update=dict(forensic_checks=checks, dispatch_action=dispatch))

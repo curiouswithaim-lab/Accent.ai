@@ -1,0 +1,3 @@
+# Source upload for `gcloud run deploy --source`. Without this file gcloud applies .gitignore,
+# which would drop demo_data/ and the extraction cache that the image is meant to ship.
+#!include:.dockerignore

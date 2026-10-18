@@ -1,5 +1,7 @@
 # 🛰️ Accent.AI
 
+*Audit of Carbon Credits and ENvironmenTal clearances using AI*
+
 **Independent Satellite Verification for Environmental Filings and Carbon Credit Baselines**
 
 Accent.AI checks the truth of environmental filings—such as **Environmental Impact Assessments (EIAs)** and **Voluntary Carbon Credit Project Design Documents (PDDs)**—against independent satellite observations and climate reanalysis.

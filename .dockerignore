@@ -1,16 +1,38 @@
+# Local tooling & VCS
 .venv/
+venv/
 __pycache__/
 *.pyc
-.terratrial_artifacts/
 .git/
 .gitignore
+.gcloudignore
 .DS_Store
+.agents/
+.claude/
+.idea/
+.vscode/
+tests/
+
+# Docs (README stays)
 *.md
 !README.md
-gemini-code-*.md
-*.json.key
+
+# Secrets & credentials (never ship)
+.env
+.env.*
+*.env
 service-account*.json
+*credentials*.json
+*credential*.json
+*key*.json
+*.key
+*.pem
+.streamlit/secrets.toml
+
+# Filings, slides & runtime output
 *.pdf
-.accent_artifacts/
-.agents/
-tests/
+*.pptx
+*.keynote
+*.log
+.terratrial_artifacts/
+.accent_artifacts/filings/

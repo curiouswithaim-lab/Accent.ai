@@ -1,6 +1,6 @@
 """Accent.AI — 3-column forensic dashboard (Streamlit).
 
-Accent.AI: Audit of Carbon Credits and ENvironmental impacT on land using AI.
+Accent.AI: Audit of Carbon Credits and ENvironmenTal clearances using AI.
 Run locally:   streamlit run app.py
 Cloud Run:     streamlit run app.py --server.port=8080 --server.address=0.0.0.0
 """
@@ -18,13 +18,14 @@ import plotly.graph_objects as go
 import pydeck as pdk
 import streamlit as st
 from plotly.subplots import make_subplots
+from streamlit.components.v1 import html as components_html
 
 st.set_page_config(
     page_title="Accent.AI — Satellite Verification for Environmental Filings",
     page_icon="🛰️",
     layout="wide",
-    initial_sidebar_state="expanded",
-    menu_items={"About": "Accent.AI (Audit of Carbon Credits and ENvironmental impacT on land using AI) · AI Builder Cup 2026 · Google Cloud JAPAC Hackathon (Theme 6)"},
+    initial_sidebar_state="auto",
+    menu_items={"About": "Accent.AI (Audit of Carbon Credits and ENvironmenTal clearances using AI) · AI Builder Cup 2026 · Google Cloud JAPAC Hackathon (Theme 6)"},
 )
 
 try:
@@ -386,6 +387,38 @@ color:#e2e8f0;font-weight:600;transition:all .2s ease;}
 .tt-side-s{font-size:.74rem;color:var(--muted);margin:-4px 0 10px;line-height:1.45;}
 .tt-stat{font-size:.72rem;color:var(--muted);line-height:1.7;}
 .tt-stat b{color:#e2e8f0;font-weight:600;}
+/* run button pulses once a PDF is attached (filter, because sidebar buttons pin box-shadow with !important) */
+@keyframes tt-ready{0%,100%{filter:brightness(1) drop-shadow(0 0 0 rgba(45,212,191,0));}
+50%{filter:brightness(1.35) drop-shadow(0 0 14px rgba(45,212,191,.85));}}
+.st-key-run_upload_single button[kind="primary"],.st-key-run_landing_upload button[kind="primary"],
+.st-key-run_mobile_upload button[kind="primary"]{animation:tt-ready 1.4s ease-in-out infinite;}
+[data-testid="stElementContainer"]:has(iframe[height="0"]){display:none;}
+.st-key-mobile_upload{background:#0d1424;border:1px solid rgba(45,212,191,.25);border-radius:14px;padding:16px;margin-bottom:8px;}
+@media (min-width:769px){.st-key-mobile_upload{display:none;}}
+/* phones */
+@media (max-width:640px){
+  .block-container{padding-left:.8rem;padding-right:.8rem;padding-top:.6rem;}
+  .tt-hero{padding:14px 16px;}
+  .tt-brand{gap:12px;}
+  .tt-logo{width:38px;height:38px;}
+  .tt-title{font-size:1.5rem;}
+  .tt-sub{font-size:.78rem;}
+  .tt-land-h{font-size:1.2rem!important;}
+  .tt-sbs-table,.tt-metric-row-body,.tt-ledger{grid-template-columns:1fr;}
+  .tt-row,.tt-dl{grid-template-columns:1fr;gap:2px;}
+  .tt-sbs-header-bar,.tt-ledger-head-bar,.tt-metric-row-header,.tt-oos-header,.tt-metric-row-footer,
+  .tt-check-head,.tt-dispatch .hd,.tt-col-head{flex-wrap:wrap;gap:6px;}
+  .tt-col-head .sub{margin-left:0;text-align:left;}
+  .tt-dh-sep,.tt-strip .sep{display:none;}
+  .tt-mid-sbs-box,.tt-ledger-box,.tt-evidence-panel,.tt-oos-summary-card{padding:12px 12px;}
+  .tt-sbs-col{padding:12px 14px;}
+  .tt-sbs-val code{font-size:1.25rem!important;}
+  .tt-verdict .t{font-size:1.05rem;}
+  .tt-mode-banner{padding:12px 14px;}
+  .tt-mode-banner .hl{font-size:1.05rem;}
+  .tt-case{height:auto;min-height:0;max-height:none;}
+  code,[data-testid="stMarkdownContainer"] code{white-space:normal!important;word-break:break-word;}
+}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -459,7 +492,7 @@ def render_hero() -> None:
     <div class="tt-hero">
       <div class="tt-brand">{LOGO_SVG}
         <div><h1 class="tt-title">Accent.AI</h1>
-        <div class="tt-sub"><div style="font-size:0.95rem;font-weight:700;color:#5eead4;letter-spacing:0.02em;margin-bottom:4px;">Audit of Carbon Credits and ENvironmental impacT on land using AI</div>Independent Satellite Audit Platform · Verifying <b>Environmental Impact Assessments</b> &amp; <b>Carbon Credit Baselines</b>.</div></div>
+        <div class="tt-sub"><div style="font-size:0.95rem;font-weight:700;color:#5eead4;letter-spacing:0.02em;margin-bottom:4px;">Audit of Carbon Credits and ENvironmenTal clearances using AI</div>Independent Satellite Audit Platform · Verifying <b>Environmental Impact Assessments</b> &amp; <b>Carbon Credit Baselines</b>.</div></div>
       </div>
     </div>""")
 
@@ -467,6 +500,30 @@ def render_hero() -> None:
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
+def run_parent_js(body: str) -> None:
+    # components.html runs in a same-origin iframe, so it can reach the app document via window.parent.
+    components_html("<script>(function(){const doc=window.parent.document;const win=window.parent;" + body + "})();</script>",
+                    height=0)
+
+
+def upload_and_run(uploader_key: str, button_key: str, label: str) -> None:
+    pdf = st.file_uploader("Upload Regulatory PDF (EIA or Carbon PDD)", type=["pdf"], key=uploader_key,
+                           label_visibility="collapsed")
+    token = f"{button_key}:{getattr(pdf, 'file_id', None) or (pdf.name, pdf.size)}" if pdf is not None else None
+    fresh = token is not None and ss.get(f"ran_{button_key}") != token
+    if st.button(label, key=button_key, width="stretch", disabled=pdf is None,
+                 type="primary" if fresh else "secondary"):
+        ss[f"ran_{button_key}"] = token
+        ss.pending = {"kind": "upload", "bytes": pdf.getvalue(), "name": pdf.name, "mode_hint": None}
+        st.rerun()
+    if fresh and ss.get(f"focused_{button_key}") != token:
+        ss[f"focused_{button_key}"] = token
+        run_parent_js("let n=0;const go=()=>{const b=doc.querySelector('.st-key-" + button_key + " button');"
+                      "if(b&&!b.disabled&&b.offsetParent){b.style.animation='';b.scrollIntoView({behavior:'smooth',block:'center'});"
+                      "b.focus({preventScroll:true});b.addEventListener('click',()=>{b.style.animation='none';},{once:true});}"
+                      "else if(n++<30){setTimeout(go,100);}};go();")
+
+
 def render_sidebar() -> Dict[str, bool]:
     with st.sidebar:
         if HAS_GOLDEN and GOLDEN_CASES:
@@ -507,16 +564,7 @@ def render_sidebar() -> Dict[str, bool]:
         H('<div class="tt-side-h">Live Document Upload</div>'
           '<div class="tt-side-s">Upload an environmental clearance report (EIA) or carbon project document (PDD). Gemini identifies the document type, extracts claimed measurements and coordinates, and verifies them against satellite observations.</div>')
 
-        up_pdf = st.file_uploader("Upload Regulatory PDF (EIA or Carbon PDD)", type=["pdf"], key="up_single_pdf", label_visibility="collapsed")
-        if st.button("Run Satellite Audit", key="run_upload_single", width="stretch", disabled=up_pdf is None,
-                     type="primary" if up_pdf is not None else "secondary"):
-            ss.pending = {
-                "kind": "upload",
-                "bytes": up_pdf.getvalue(),
-                "name": up_pdf.name,
-                "mode_hint": None,  # Autonomous Gemini classification (EIA vs Carbon)
-            }
-            st.rerun()
+        upload_and_run("up_single_pdf", "run_upload_single", "Run Satellite Audit")
 
         if HAS_GOLDEN and GOLDEN_CASES:
             with st.expander("Need sample test PDFs?"):
@@ -1763,7 +1811,7 @@ def render_dispatch_section(a: Dict[str, Any]) -> None:
         btn_lbl = "Publish Regulatory Clearance (Pub/Sub)"
         toast_lbl = "Regulatory clearance published"
         exp_lbl = "Regulatory Directive & Baseline Coordinates"
-    elif d.action_type == "REGISTRY_ESCROW_HOLD_AND_RANGER_ALERT":
+    elif d.action_type.startswith("REGISTRY_ESCROW_HOLD"):
         btn_lbl = "Send Registry Escrow Hold (Pub/Sub)"
         toast_lbl = "Registry escrow hold published"
         exp_lbl = "Registry Directive & Verification Coordinates"
@@ -1818,9 +1866,13 @@ def _report_json(a: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 def render_landing() -> None:
     if HAS_GOLDEN and GOLDEN_CASES:
-        H("""<div style="text-align:center;margin:18px 0 18px"><div style="font-family:'Space Grotesk';font-size:1.55rem;font-weight:600;color:#f1f5f9">
+        H("""<div style="text-align:center;margin:18px 0 18px"><div class="tt-land-h" style="font-family:'Space Grotesk';font-size:1.55rem;font-weight:600;color:#f1f5f9">
         Independent Satellite Verification for Environmental Filings &amp; Carbon Baselines. <span style="color:#5eead4">Evidence Backed by Earth Observation.</span></div>
         <div style="color:#94a3b8;font-size:.92rem;margin-top:6px">Simulation run for benchmarking and demo. Select a filing below or upload via the sidebar.</div></div>""")
+        with st.container(key="mobile_upload"):
+            H('<div class="tt-side-h">Upload a filing (PDF)</div>'
+              '<div class="tt-side-s">An EIA or carbon PDD. Gemini extracts the claims and checks them against satellite records.</div>')
+            upload_and_run("mobile_pdf", "run_mobile_upload", "Run Satellite Audit")
         cols = st.columns(2, gap="large")
         bullets = {
             "eia": ["Effluent sampled during a 98th-percentile flood (8× river dilution)",
@@ -1842,7 +1894,7 @@ def render_landing() -> None:
                     st.rerun()
     else:
         H("""<div style="text-align:center;margin:20px 0 28px">
-        <div style="font-family:'Space Grotesk';font-size:1.65rem;font-weight:600;color:#f1f5f9">
+        <div class="tt-land-h" style="font-family:'Space Grotesk';font-size:1.65rem;font-weight:600;color:#f1f5f9">
         Independent Satellite Verification for Environmental Filings &amp; Carbon Baselines. <span style="color:#5eead4">Evidence Backed by Earth Observation.</span></div>
         <div style="color:#94a3b8;font-size:1rem;margin-top:8px">Upload an Environmental Impact Assessment (EIA) or Carbon Credit Project Design Document (PDD) to begin independent satellite verification.</div>
         </div>""")
@@ -1853,20 +1905,7 @@ def render_landing() -> None:
             <div style="font-family:'Space Grotesk';font-size:1.2rem;font-weight:600;color:#f8fafc;margin-bottom:6px">📁 Upload Filing Dossier (PDF)</div>
             <div style="color:#94a3b8;font-size:.92rem;line-height:1.5;margin-bottom:16px">Gemini classifies the document type (EIA vs Carbon PDD), extracts declared sampling claims and coordinates, and audits them against independent satellite records (CHIRPS, ERA5, SRTM DEM, Sentinel-2 / Landsat 5/7, Hansen GFC, and NOAA GSOD).</div>
             </div>""")
-            landing_pdf = st.file_uploader(
-                "Upload Filing Dossier (PDF)",
-                type=["pdf"],
-                key="landing_single_pdf",
-                label_visibility="collapsed",
-            )
-            if st.button("Run Independent Satellite Audit  →", key="run_landing_upload", type="primary", width="stretch", disabled=landing_pdf is None):
-                ss.pending = {
-                    "kind": "upload",
-                    "bytes": landing_pdf.getvalue(),
-                    "name": landing_pdf.name,
-                    "mode_hint": None,
-                }
-                st.rerun()
+            upload_and_run("landing_single_pdf", "run_landing_upload", "Run Independent Satellite Audit  →")
 
     st.write("")
     st.write("")
@@ -1887,6 +1926,10 @@ def render_landing() -> None:
 def main() -> None:
     render_hero()
     if ss.pending:
+        # On phones the sidebar is a drawer over the page; close it so the progress and results are visible.
+        run_parent_js("if(win.innerWidth<=768){const b=doc.querySelector('[data-testid=\"stSidebarCollapseButton\"] button');"
+                      "const s=doc.querySelector('[data-testid=\"stSidebar\"]');"
+                      "if(b&&s&&s.getAttribute('aria-expanded')!=='false'){b.click();}}")
         opts = {
             "use_gemini": ss.get("opt_use_gemini", PS["gemini_ok"]),
             "live_golden": ss.get("opt_live_golden", False),

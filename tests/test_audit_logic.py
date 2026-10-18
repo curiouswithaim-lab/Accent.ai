@@ -193,7 +193,9 @@ class ReferenceAreaPressure(unittest.TestCase):
         self.assertEqual(r.forensic_checks[1].status, "FAILED")
         self.assertIn("faster than the project area", r.forensic_checks[1].statistical_discrepancy)
         self.assertNotEqual(r.verdict_banner, "VERIFIED BASELINE INTEGRITY")
-        self.assertEqual(r.dispatch_action.action_type, "REGISTRY_ESCROW_HOLD_AND_RANGER_ALERT")
+        self.assertEqual(r.forensic_checks[2].status, "PASSED")
+        self.assertEqual(r.dispatch_action.action_type, "REGISTRY_ESCROW_HOLD")
+        self.assertNotIn("ranger", r.dispatch_action.target_recipient.lower())
 
     def test_matched_reference_area_passes(self):
         r, _ = audit(*self._inputs(1.2, 1.3))

@@ -1,5 +1,5 @@
 # Accent.AI — Google Cloud Run production image
-# Accent.AI: Audit of Carbon Credits and ENvironmental impacT on land using AI
+# Accent.AI: Audit of Carbon Credits and ENvironmenTal clearances using AI
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -9,7 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8080 \
     STREAMLIT_SERVER_HEADLESS=true \
     STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
-    ACCENT_LOCAL_ARTIFACTS=/tmp/accent_artifacts
+    ACCENT_LOCAL_ARTIFACTS=/app/.accent_artifacts
 
 WORKDIR /app
 

@@ -1,5 +1,5 @@
 # Accent.AI — Specification
-**Full Title:** Audit of Carbon Credits and ENvironmental impacT on land using AI  
+**Full Title:** Audit of Carbon Credits and ENvironmenTal clearances using AI  
 **Target GCP Project ID:** `<your-gcp-project-id>`
 
 ## 1. Project Overview

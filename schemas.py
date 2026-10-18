@@ -1,6 +1,6 @@
 """Accent.AI Pydantic schemas.
 
-Accent.AI: Audit of Carbon Credits and ENvironmental impacT on land using AI.
+Accent.AI: Audit of Carbon Credits and ENvironmenTal clearances using AI.
 Two families of models live here:
   1. Gemini Structured-Output contracts (ExtractedFilingData, FullAuditReport, ...)
      passed directly as `response_schema` to the google-genai SDK.
@@ -80,7 +80,7 @@ class ForensicCheckResult(BaseModel):
 
 class GroundDispatchAction(BaseModel):
     pubsub_topic: str
-    action_type: str = Field(description="COUNTER_SAMPLING_DISPATCH, REGISTRY_ESCROW_HOLD_AND_RANGER_ALERT, COMPLIANCE_CLEARED, or OUT_OF_SCOPE_NOTICE")
+    action_type: str = Field(description="COUNTER_SAMPLING_DISPATCH, REGISTRY_ESCROW_HOLD, REGISTRY_ESCROW_HOLD_AND_RANGER_ALERT, COMPLIANCE_CLEARED, or OUT_OF_SCOPE_NOTICE")
     priority: str = Field(default="ROUTINE", description="CRITICAL, HIGH, ROUTINE, or INFORMATIONAL")
     target_recipient: str
     recommended_coordinates_lat: float

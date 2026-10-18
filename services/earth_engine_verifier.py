@@ -1,6 +1,6 @@
 """Earth Engine + BigQuery spatio-temporal verification for Accent.AI.
 
-Accent.AI: Audit of Carbon Credits and ENvironmental impacT on land using AI.
+Accent.AI: Audit of Carbon Credits and ENvironmenTal clearances using AI.
 Layers inspected for the coordinates and sampling dates extracted from a filing:
   * CHIRPS daily precipitation (UCSB-CHG/CHIRPS/DAILY)  -> temporal confounding / dilution
   * ERA5-Land hourly 10 m wind (ECMWF/ERA5_LAND/HOURLY)   -> upwind sensor placement

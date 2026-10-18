@@ -1,25 +1,25 @@
 # Accent.AI — Python dependencies
-# Accent.AI: Audit of Carbon Credits and ENvironmental impacT on land using AI
-# Lower-bounded (and upper-capped on majors) so the same file installs on the
-# local Python 3.9 toolchain and in the Python 3.12 Cloud Run image.
+# Accent.AI: Audit of Carbon Credits and ENvironmenTal clearances using AI
+# Pinned to the versions the app was tested with; all install on both the local
+# Python 3.9 toolchain and the Python 3.12 Cloud Run image.
 
 # --- UI ---
-streamlit>=1.38,<2
-plotly>=5.22,<7
-pydeck>=0.9,<1
-pandas>=2.0,<3
-numpy>=1.26,<3
+streamlit==1.50.0
+plotly==6.9.0
+pydeck==0.9.3
+pandas==2.3.3
+numpy==2.0.2
 
 # --- Schemas ---
-pydantic>=2.7,<3
+pydantic==2.13.5
 
 # --- Google Cloud (mandatory hackathon stack) ---
-google-genai>=1.0,<2
-earthengine-api>=1.0,<2
-google-cloud-bigquery>=3.25,<4
-google-cloud-storage>=2.17,<4
-google-cloud-pubsub>=2.23,<3
-google-auth>=2.30,<3
+google-genai==1.47.0
+earthengine-api==1.6.15
+google-cloud-bigquery==3.41.0
+google-cloud-storage==3.9.0
+google-cloud-pubsub==2.38.0
+google-auth==2.50.0
 
 # --- PDF fallback text extraction (offline heuristic mode) ---
-pypdf>=4.2,<6
+pypdf==5.9.0
