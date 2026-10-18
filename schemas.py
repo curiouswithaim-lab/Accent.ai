@@ -128,6 +128,8 @@ class RainfallEvidence(BaseModel):
     estimated_dilution_factor: float
     dry_window_suggestion: str
     bigquery_corroboration: Optional[str] = None
+    monthly_dates: List[str] = []
+    monthly_mm: List[float] = []
 
 
 class NdviEvidence(BaseModel):

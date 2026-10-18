@@ -710,7 +710,10 @@ def chart_ndvi(ev: SatelliteEvidence, x: Optional[ExtractedFilingData] = None) -
     sensor_lbl = get_sensor_label(x, ev)
     sensor_short = get_sensor_label(x, ev, short=True)
     fig = make_subplots(specs=[[{"secondary_y": True}]])
-    rain = pd.DataFrame({"d": pd.to_datetime(r.dates), "mm": r.precip_mm}).set_index("d").resample("MS").sum()
+    if r.monthly_dates:
+        rain = pd.DataFrame({"mm": r.monthly_mm}, index=pd.to_datetime(r.monthly_dates))
+    else:
+        rain = pd.DataFrame({"d": pd.to_datetime(r.dates), "mm": r.precip_mm}).set_index("d").resample("MS").sum()
     fig.add_bar(x=rain.index, y=rain["mm"], name="Monthly Rainfall (CHIRPS)", marker_color="rgba(56,189,248,.22)",
                 secondary_y=True, hovertemplate="%{x|%b %Y}: %{y:.0f} mm<extra></extra>")
     fig.add_scatter(x=n.dates, y=n.ndvi, mode="lines", name=sensor_lbl,
@@ -858,6 +861,14 @@ def render_map(report: FullAuditReport, ev: SatelliteEvidence) -> None:
                           "name": _ascii(ring.label), "kind": f"{ring.change_pct:+.0f}% canopy loss change",
                           "fill": [244, 63, 94, 70] if hot else [251, 191, 36, 30] if warm else [148, 163, 184, 10],
                           "line": [244, 63, 94, 200] if hot else [148, 163, 184, 90]})
+        bs = ev.baseline_sampling
+        for s in (bs.sites if bs else []):
+            ref = s.role == "CONTROL_SITE"
+            polys.append({"polygon": circle_polygon(s.latitude, s.longitude, s.radius_km),
+                          "name": _ascii(f"{'Reference' if ref else 'Project'} sample area: {s.label}"),
+                          "kind": f"{s.loss_rate_pct:.2f}%/yr forest loss ({_ascii(bs.period)}, canopy >= {bs.canopy_threshold_pct:g}%)",
+                          "fill": [244, 63, 94, 45] if ref else [45, 212, 191, 45],
+                          "line": [244, 63, 94, 220] if ref else [45, 212, 191, 220]})
         ctrl = next((p for p in x.coordinates if p.role == "CONTROL_SITE"), None)
         if ctrl:
             lines.append({"from": [proj.longitude, proj.latitude], "to": [ctrl.longitude, ctrl.latitude], "color": [244, 63, 94, 170]})
@@ -889,14 +900,15 @@ def render_map(report: FullAuditReport, ev: SatelliteEvidence) -> None:
                    "label": "INSPECT", "kind": f"{d.action_type.replace('_', ' ').title()} · {d.recommended_coordinates_lat:.4f}, "
                                                 f"{d.recommended_coordinates_lon:.4f}", "color": [251, 191, 36, 255]}
     all_pos = [q["pos"] for q in pts] + [dispatch_pt["pos"]]
-    span = max(math.hypot((a[0] - proj.longitude) * 111 * math.cos(math.radians(proj.latitude)), (a[1] - proj.latitude) * 111) for a in all_pos)
-    span = max(span, R + 5 if x.filing_mode == "CARBON_OFFSET" else 2.5)
-    zoom = max(8.5, min(14.5, 13.6 - math.log2(max(span, 0.5))))
     if x.filing_mode == "CARBON_OFFSET":
-        clat, clon = proj.latitude, proj.longitude
+        clon = (min(a[0] for a in all_pos) + max(a[0] for a in all_pos)) / 2
+        clat = (min(a[1] for a in all_pos) + max(a[1] for a in all_pos)) / 2
     else:
         clat = sum(a[1] for a in all_pos) / len(all_pos)
         clon = sum(a[0] for a in all_pos) / len(all_pos)
+    span = max(math.hypot((a[0] - clon) * 111 * math.cos(math.radians(clat)), (a[1] - clat) * 111) for a in all_pos)
+    span = max(span, R + 5 if x.filing_mode == "CARBON_OFFSET" else 2.5)
+    zoom = max(4.5, min(14.5, 13.6 - math.log2(max(span, 0.5))))
     base_r = 400 if x.filing_mode == "CARBON_OFFSET" else 70
     layers = [
         pdk.Layer("PolygonLayer", data=polys, get_polygon="polygon", get_fill_color="fill", get_line_color="line",
@@ -1452,10 +1464,10 @@ def render_plain_english_comparison(a: Dict[str, Any]) -> None:
                 actual_desc = (
                     f"Hansen Global Forest Change data across {n_sites} project sample area(s) shows "
                     f"<b>historical forest loss of only {actual_val} during {period}</b>. "
-                    f"The project's reported baseline loss rate is inflated above actual observed deforestation, "
-                    f"generating unearned carbon offset credits against an exaggerated counterfactual."
+                    f"The filed baseline rate is well above the deforestation observed in these areas, "
+                    f"which would over-credit avoided emissions if it holds across the project."
                 )
-                variance_badge = f"+{claimed_rate - sat_loss:.1f}%/yr Baseline Inflation (+{disc:.0f}% Discrepancy)"
+                variance_badge = f"+{claimed_rate - sat_loss:.1f}%/yr Baseline Inflation ({claimed_rate / max(sat_loss, 0.05):.1f}× observed loss)"
                 status_cls = "warn" if report.forensic_checks[0].status == "WARNING" else "fail"
             else:
                 actual_val = f"{sat_loss:.2f}%/yr"

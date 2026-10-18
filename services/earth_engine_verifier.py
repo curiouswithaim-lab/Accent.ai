@@ -271,9 +271,10 @@ def _live_rainfall(ctx: Dict[str, Any]) -> RainfallEvidence:
     chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").select("precipitation")
     start, end = d - dt.timedelta(days=240), d + dt.timedelta(days=121)
     clim_start, clim_end = dt.date(2009, 1, 1), dt.date(2025, 1, 1)
+    ndvi_start, ndvi_end = _ndvi_window(ctx)
     # One point time-series pull covering both the sampling window and the climatology; percentiles are
     # computed locally (a server-side map over ~5,800 daily images regularly exceeded the EE deadline).
-    rows = chirps.filterDate(min(start, clim_start).isoformat(), max(end, clim_end).isoformat()) \
+    rows = chirps.filterDate(min(start, clim_start, ndvi_start).isoformat(), max(end, clim_end, ndvi_end).isoformat()) \
         .getRegion(pt, 5566).getInfo()
     header = rows[0]
     it, ip = header.index("time"), header.index("precipitation")
@@ -293,7 +294,13 @@ def _live_rainfall(ctx: Dict[str, Any]) -> RainfallEvidence:
     pct = float((np.mean(clim < v) + np.mean(clim <= v)) / 2 * 100)
     wet = clim[clim > 1]
     dilution = float(np.clip(1.0 + antecedent / 18.0, 1.0, 15.0))
+    monthly: Dict[str, float] = {}
+    for day, v_mm in full:
+        if ndvi_start <= day < ndvi_end:
+            key = day.replace(day=1).isoformat()
+            monthly[key] = monthly.get(key, 0.0) + v_mm
     return RainfallEvidence(
+        monthly_dates=list(monthly), monthly_mm=[round(m, 1) for m in monthly.values()],
         dates=dates, precip_mm=mm, sampling_date=d.isoformat(), sampling_day_mm=round(v, 2),
         sampling_percentile=round(pct, 1), p50_wet_day_mm=round(float(np.median(wet)) if wet.size else 0.0, 2),
         p95_mm=round(float(np.percentile(clim, 95)), 2), antecedent_7d_mm=round(antecedent, 1),
